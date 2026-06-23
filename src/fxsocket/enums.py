@@ -28,8 +28,9 @@ class TradingStatus(str, Enum):
 class OrderOperation(str, Enum):
     """Order operation accepted by the terminal ``/OrderSend``.
 
-    The two ``*StopLimit`` variants exist only on MT5 — the SDK rejects
-    them client-side for MT4 accounts (see ``UnsupportedOnPlatformError``).
+    All eight are accepted by both the MT4 and MT5 terminal APIs (the MT4
+    server's ``parse_operation`` maps ``BuyStopLimit``/``SellStopLimit`` too),
+    so the SDK does not gate operations by platform.
     """
 
     BUY = "Buy"
@@ -42,9 +43,21 @@ class OrderOperation(str, Enum):
     SELL_STOP_LIMIT = "SellStopLimit"
 
 
-#: Operations that only MT5 supports.
-MT5_ONLY_OPERATIONS = frozenset(
+#: Operations that require a ``stop_limit_price``.
+STOP_LIMIT_OPERATIONS = frozenset(
     {OrderOperation.BUY_STOP_LIMIT, OrderOperation.SELL_STOP_LIMIT}
+)
+
+#: Operations that are pending orders (require an entry ``price``).
+PENDING_OPERATIONS = frozenset(
+    {
+        OrderOperation.BUY_LIMIT,
+        OrderOperation.SELL_LIMIT,
+        OrderOperation.BUY_STOP,
+        OrderOperation.SELL_STOP,
+        OrderOperation.BUY_STOP_LIMIT,
+        OrderOperation.SELL_STOP_LIMIT,
+    }
 )
 
 

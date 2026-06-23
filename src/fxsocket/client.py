@@ -15,9 +15,10 @@ import httpx
 
 from ._http import AsyncHTTP, SyncHTTP, auth_headers
 from .config import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, ENV_API_KEY
-from .errors import AuthError
+from .errors import AuthError, TerminalNotReadyError
 from .management import Accounts, AsyncAccounts
 from .models import Account
+from .terminal.client import AsyncTerminalClient, TerminalClient
 
 
 def _resolve_api_key(api_key: str | None) -> str:
@@ -51,6 +52,7 @@ class Client:
         verify_terminal_tls: bool = True,
     ) -> None:
         self._api_key = _resolve_api_key(api_key)
+        self._timeout = timeout
         #: Verify TLS for terminal calls. Private-hosting droplets use a
         #: self-signed cert; set False (or pass a CA) to reach them.
         self.verify_terminal_tls = verify_terminal_tls
@@ -61,16 +63,51 @@ class Client:
         )
         #: Account management (the v1 API).
         self.accounts = Accounts(SyncHTTP(self._http_client))
+        self._terminals: dict[tuple[str, str], TerminalClient] = {}
 
-    def terminal(self, account: Account, **kwargs: Any) -> Any:
-        """Return a REST client bound to ``account``'s terminal. (Milestone 2.)"""
-        raise NotImplementedError(
-            "Terminal REST client lands in milestone M2; "
-            f"account endpoint is {account.rest_url or '<not provisioned>'}."
-        )
+    def terminal(
+        self,
+        account: Account,
+        *,
+        verify: bool | None = None,
+        timeout: float | None = None,
+    ) -> TerminalClient:
+        """Return a REST client bound to ``account``'s terminal.
+
+        Resolves the endpoint from ``account.rest_url`` (shared pod or private
+        droplet). Raises :class:`TerminalNotReadyError` when the account has no
+        terminal yet (still provisioning, or bridge-only). Clients are cached
+        per endpoint and closed by :meth:`close`. Pass ``verify=False`` for a
+        private droplet's self-signed certificate.
+        """
+        if not account.rest_url:
+            raise TerminalNotReadyError(
+                f"Account {account.id} has no terminal endpoint yet "
+                "(still provisioning, or bridge-only)."
+            )
+        key = (account.rest_url, account.platform.value)
+        cached = self._terminals.get(key)
+        if cached is None:
+            cached = TerminalClient(
+                base_url=account.rest_url,
+                api_key=self._api_key,
+                platform=account.platform,
+                verify=self.verify_terminal_tls if verify is None else verify,
+                timeout=self._timeout if timeout is None else timeout,
+            )
+            self._terminals[key] = cached
+        return cached
 
     def close(self) -> None:
-        self._http_client.close()
+        try:
+            for term in self._terminals.values():
+                try:
+                    term.close()
+                except Exception:
+                    pass
+            self._terminals.clear()
+        finally:
+            self._http_client.close()
 
     def __enter__(self) -> Client:
         return self
@@ -99,6 +136,7 @@ class AsyncClient:
         verify_terminal_tls: bool = True,
     ) -> None:
         self._api_key = _resolve_api_key(api_key)
+        self._timeout = timeout
         self.verify_terminal_tls = verify_terminal_tls
         self._http_client = httpx.AsyncClient(
             base_url=base_url,
@@ -106,17 +144,52 @@ class AsyncClient:
             timeout=timeout,
         )
         self.accounts = AsyncAccounts(AsyncHTTP(self._http_client))
+        self._terminals: dict[tuple[str, str], AsyncTerminalClient] = {}
 
-    def terminal(self, account: Account, **kwargs: Any) -> Any:
-        """Return an async REST client bound to ``account``. (Milestone 2.)"""
-        raise NotImplementedError("Terminal REST client lands in milestone M2.")
+    def terminal(
+        self,
+        account: Account,
+        *,
+        verify: bool | None = None,
+        timeout: float | None = None,
+    ) -> AsyncTerminalClient:
+        """Return an async REST client bound to ``account``'s terminal.
+
+        See :meth:`Client.terminal`. Clients are cached per endpoint and closed
+        by :meth:`aclose`.
+        """
+        if not account.rest_url:
+            raise TerminalNotReadyError(
+                f"Account {account.id} has no terminal endpoint yet "
+                "(still provisioning, or bridge-only)."
+            )
+        key = (account.rest_url, account.platform.value)
+        cached = self._terminals.get(key)
+        if cached is None:
+            cached = AsyncTerminalClient(
+                base_url=account.rest_url,
+                api_key=self._api_key,
+                platform=account.platform,
+                verify=self.verify_terminal_tls if verify is None else verify,
+                timeout=self._timeout if timeout is None else timeout,
+            )
+            self._terminals[key] = cached
+        return cached
 
     def stream(self, account: Account, **kwargs: Any) -> Any:
         """Return a WebSocket stream for ``account``. (Milestone 3.)"""
         raise NotImplementedError("WebSocket streaming lands in milestone M3.")
 
     async def aclose(self) -> None:
-        await self._http_client.aclose()
+        try:
+            for term in self._terminals.values():
+                try:
+                    await term.aclose()
+                except Exception:
+                    pass
+            self._terminals.clear()
+        finally:
+            await self._http_client.aclose()
 
     async def __aenter__(self) -> AsyncClient:
         return self

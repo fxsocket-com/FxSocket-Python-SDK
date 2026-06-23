@@ -4,9 +4,9 @@ Python client for the [FxSocket](https://fxsocket.com) API — manage MT4/MT5
 trading accounts, and (coming next) trade and stream market data through each
 account's terminal over REST and WebSocket.
 
-> **Status:** early. Account management (the v1 API) is implemented. The
-> per-account terminal REST client and WebSocket streaming are in progress —
-> see the [roadmap](#roadmap).
+> **Status:** early. Account management (the v1 API) and the per-account
+> terminal REST client (trading, market data, account — MT4 + MT5) are
+> implemented. WebSocket streaming is next — see the [roadmap](#roadmap).
 
 ## Install
 
@@ -75,6 +75,39 @@ except AccountCapError as e:
     print(f"Plan limit reached: {e.current}/{e.cap}")
 ```
 
+## Trading & market data
+
+Once an account is connected, `client.terminal(account)` returns a REST client
+bound to that account's terminal (resolved from `account.rest_url`):
+
+```python
+from fxsocket import Client
+
+with Client(api_key="fxs_live_…") as fx:
+    account = fx.accounts.get("…")        # must have a terminal (status connected)
+    term = fx.terminal(account)
+
+    summary = term.account_summary()       # balance, equity, margin, …
+    quote = term.quote("EURUSD")           # latest tick
+    bars = term.price_history("EURUSD", "M5", from_="2026-06-01")
+
+    result = term.order_send(              # market buy
+        symbol="EURUSD", operation="Buy", volume=0.10,
+        stop_loss=1.07, take_profit=1.10,
+    )
+    if result.success:
+        term.order_modify(result.order, take_profit=1.12)   # None keeps SL
+        term.order_close(result.order)
+```
+
+The client validates inputs before sending — and protects against a real
+footgun: in `order_modify`, a bare `stop_loss=0.0` would *remove* your
+stop-loss, so it's rejected. Pass `clear_stop_loss=True` to remove one on
+purpose; `None` (the default) keeps the current value.
+
+MT4 and MT5 share one interface. MT5-only timeframes (`M2`, `M3`, `H2`, `H6`,
+`H8`, `H12`) raise `UnsupportedOnPlatformError` on MT4 before any request.
+
 ## Private hosting
 
 Privately-hosted accounts (dedicated droplet) are listed, traded, and streamed
@@ -86,7 +119,7 @@ terminal API will require `verify_terminal_tls=False` (or a pinned CA).
 ## Roadmap
 
 - [x] **M1** — Management client (v1 accounts CRUD), sync + async, typed models.
-- [ ] **M2** — Terminal REST client (account, market data, trading) for MT4 + MT5.
+- [x] **M2** — Terminal REST client (account, market data, trading) for MT4 + MT5.
 - [ ] **M3** — WebSocket streaming (ticks, bars, account, positions, trades).
 - [ ] **M4** — Private-hosting polish (self-signed TLS), examples.
 - [ ] **M5** — Publish to PyPI.
