@@ -1,0 +1,64 @@
+"""FxSocket Python SDK.
+
+Account management today (the v1 API); per-account terminal REST and
+WebSocket streaming for MT4/MT5 land in the next milestones.
+"""
+
+from __future__ import annotations
+
+from . import errors
+from ._version import __version__
+from .client import AsyncClient, Client
+from .enums import (
+    DealEntry,
+    HealthStatus,
+    OrderKind,
+    OrderOperation,
+    Platform,
+    Timeframe,
+    TradingStatus,
+)
+from .errors import (
+    AccountCapError,
+    AuthError,
+    ConnectFailedError,
+    DuplicateAccountError,
+    FxSocketError,
+    NoSubscriptionError,
+    NotFoundError,
+    RateLimitError,
+    StreamError,
+    TerminalNotReadyError,
+    TerminalTimeoutError,
+    UnsupportedOnPlatformError,
+    ValidationError,
+)
+from .models import Account
+
+__all__ = [
+    "__version__",
+    "Client",
+    "AsyncClient",
+    "Account",
+    "Platform",
+    "TradingStatus",
+    "OrderOperation",
+    "OrderKind",
+    "DealEntry",
+    "HealthStatus",
+    "Timeframe",
+    "errors",
+    "FxSocketError",
+    "AuthError",
+    "RateLimitError",
+    "ValidationError",
+    "NotFoundError",
+    "AccountCapError",
+    "NoSubscriptionError",
+    "DuplicateAccountError",
+    "ConnectFailedError",
+    "TerminalNotReadyError",
+    "TerminalTimeoutError",
+    "UnsupportedOnPlatformError",
+    "StreamError",
+]

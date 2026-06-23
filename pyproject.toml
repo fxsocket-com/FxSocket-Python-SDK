@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fxsocket"
+dynamic = ["version"]
+description = "Python SDK for the FxSocket API — MT4/MT5 account management, trading, and real-time streaming."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "FxSocket" }]
+keywords = ["fxsocket", "metatrader", "mt4", "mt5", "trading", "forex"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "License :: OSI Approved :: MIT License",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.5",
+    "websockets>=12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[project.urls]
+Homepage = "https://fxsocket.com"
+Documentation = "https://api.fxsocket.com/v1/docs"
+Source = "https://github.com/fxsocket-com/FxSocket-Python-SDK"
+
+[tool.hatch.version]
+path = "src/fxsocket/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fxsocket"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_ignores = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+files = ["src/fxsocket"]
