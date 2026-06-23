@@ -4,9 +4,10 @@ Python client for the [FxSocket](https://fxsocket.com) API — manage MT4/MT5
 trading accounts, and (coming next) trade and stream market data through each
 account's terminal over REST and WebSocket.
 
-> **Status:** early. Account management (the v1 API) and the per-account
-> terminal REST client (trading, market data, account — MT4 + MT5) are
-> implemented. WebSocket streaming is next — see the [roadmap](#roadmap).
+> **Status:** account management (the v1 API), the per-account terminal REST
+> client (trading, market data, account — MT4 + MT5), and WebSocket streaming
+> are all implemented and exercised against live accounts. Not yet published to
+> PyPI — see the [roadmap](#roadmap).
 
 ## Install
 
@@ -108,6 +109,55 @@ purpose; `None` (the default) keeps the current value.
 MT4 and MT5 share one interface. MT5-only timeframes (`M2`, `M3`, `H2`, `H6`,
 `H8`, `H12`) raise `UnsupportedOnPlatformError` on MT4 before any request.
 
+> **MT4 history note:** on MT4, `price_history` with `from_`/`to` bounds (or the
+> `D1` timeframe) can fail server-side with `CopyRates failed` when the
+> terminal hasn't loaded that history. Calling `price_history(symbol, tf)`
+> without date bounds returns the most recent bars reliably.
+
+## Streaming (WebSocket)
+
+Subscribe to live ticks, bars, account, positions, trades, and terminal status.
+Streaming is async-first; a synchronous wrapper is also provided.
+
+```python
+import asyncio
+from fxsocket import AsyncClient, Tick, Bar, AccountUpdate
+
+async def main():
+    async with AsyncClient(api_key="fxs_live_…") as fx:
+        account = await fx.accounts.get("…")
+        async with fx.stream(account) as s:
+            await s.subscribe_prices("EURUSD")
+            await s.subscribe_bars("EURUSD", "M5")
+            await s.subscribe_account()
+            async for event in s:
+                match event:
+                    case Tick():
+                        print(event.symbol, event.data.bid, event.data.ask)
+                    case Bar():
+                        print(event.symbol, event.timeframe, event.data.close)
+                    case AccountUpdate():
+                        print("equity", event.data.equity)
+
+asyncio.run(main())
+```
+
+Synchronous equivalent:
+
+```python
+from fxsocket import Client, Tick
+
+with Client(api_key="fxs_live_…") as fx:
+    with fx.stream(fx.accounts.get("…")) as s:
+        s.subscribe_prices("EURUSD")
+        for event in s:
+            if isinstance(event, Tick):
+                print(event.data.bid, event.data.ask)
+```
+
+A dropped connection auto-reconnects and replays active subscriptions
+(`auto_reconnect=True` by default).
+
 ## Private hosting
 
 Privately-hosted accounts (dedicated droplet) are listed, traded, and streamed
@@ -120,8 +170,8 @@ terminal API will require `verify_terminal_tls=False` (or a pinned CA).
 
 - [x] **M1** — Management client (v1 accounts CRUD), sync + async, typed models.
 - [x] **M2** — Terminal REST client (account, market data, trading) for MT4 + MT5.
-- [ ] **M3** — WebSocket streaming (ticks, bars, account, positions, trades).
-- [ ] **M4** — Private-hosting polish (self-signed TLS), examples.
+- [x] **M3** — WebSocket streaming (ticks, bars, account, positions, trades).
+- [x] **M4** — Private-hosting (self-signed TLS via `verify_terminal_tls=False`), examples.
 - [ ] **M5** — Publish to PyPI.
 
 ## Development

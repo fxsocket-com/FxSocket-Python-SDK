@@ -356,3 +356,36 @@ class HealthChecks(_Camel):
     terminal: bool
     broker: bool
     account: bool
+
+
+# --------------------------------------------------------------------------- #
+# Terminal — streaming payloads (the inner ``data`` of some WS events)
+# --------------------------------------------------------------------------- #
+
+
+class TradeEventData(_Camel):
+    """A trade transaction pushed on the ``trades`` stream.
+
+    ``deal`` / ``position`` are 0 on MT4 (no per-deal model); ``entry`` is the
+    deal direction (compare against :class:`fxsocket.DealEntry`).
+    """
+
+    deal: int
+    order: int
+    position: int
+    symbol: str
+    type: str
+    entry: str
+    volume: float
+    price: float
+    profit: float
+    comment: str
+    time: str
+
+
+class TerminalStatusData(_Camel):
+    """Terminal status pushed (~1/s) on the ``terminal`` stream."""
+
+    connected: bool
+    trade_allowed: bool
+    server_time: str

@@ -1,15 +1,14 @@
 """Top-level entry points: :class:`Client` (sync) and :class:`AsyncClient`.
 
-Both expose ``.accounts`` (the management API). The per-account terminal REST
-client (``.terminal(account)``) and WebSocket stream (``.stream(account)``)
-arrive in later milestones; their signatures are fixed here so the public
-surface is stable.
+Both expose ``.accounts`` (the management API), ``.terminal(account)`` (the
+per-account terminal REST client), and ``.stream(account)`` (WebSocket
+streaming — a sync :class:`~fxsocket.Stream` or an async
+:class:`~fxsocket.AsyncStream`).
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any
 
 import httpx
 
@@ -19,6 +18,7 @@ from .errors import AuthError, TerminalNotReadyError
 from .management import Accounts, AsyncAccounts
 from .models import Account
 from .terminal.client import AsyncTerminalClient, TerminalClient
+from .terminal.stream import AsyncStream, Stream
 
 
 def _resolve_api_key(api_key: str | None) -> str:
@@ -98,6 +98,40 @@ class Client:
             self._terminals[key] = cached
         return cached
 
+    def stream(
+        self,
+        account: Account,
+        *,
+        verify: bool | None = None,
+        auto_reconnect: bool = True,
+    ) -> Stream:
+        """Open a synchronous WebSocket stream for ``account``.
+
+        Returns a context-managed :class:`~fxsocket.Stream`; use it as
+        ``with client.stream(account) as s:`` and iterate it. Raises
+        :class:`TerminalNotReadyError` if the account has no WS endpoint yet.
+        """
+        if not account.ws_url:
+            raise TerminalNotReadyError(
+                f"Account {account.id} has no WebSocket endpoint yet "
+                "(still provisioning, or bridge-only)."
+            )
+        verify_tls = self.verify_terminal_tls if verify is None else verify
+        api_key = self._api_key
+        platform = account.platform
+        ws_url = account.ws_url
+
+        def factory() -> AsyncStream:
+            return AsyncStream(
+                ws_url=ws_url,
+                api_key=api_key,
+                platform=platform,
+                verify=verify_tls,
+                auto_reconnect=auto_reconnect,
+            )
+
+        return Stream(factory)
+
     def close(self) -> None:
         try:
             for term in self._terminals.values():
@@ -176,9 +210,31 @@ class AsyncClient:
             self._terminals[key] = cached
         return cached
 
-    def stream(self, account: Account, **kwargs: Any) -> Any:
-        """Return a WebSocket stream for ``account``. (Milestone 3.)"""
-        raise NotImplementedError("WebSocket streaming lands in milestone M3.")
+    def stream(
+        self,
+        account: Account,
+        *,
+        verify: bool | None = None,
+        auto_reconnect: bool = True,
+    ) -> AsyncStream:
+        """Open an async WebSocket stream for ``account``.
+
+        Returns an :class:`~fxsocket.AsyncStream`; use it as
+        ``async with client.stream(account) as s:`` and iterate it. Raises
+        :class:`TerminalNotReadyError` if the account has no WS endpoint yet.
+        """
+        if not account.ws_url:
+            raise TerminalNotReadyError(
+                f"Account {account.id} has no WebSocket endpoint yet "
+                "(still provisioning, or bridge-only)."
+            )
+        return AsyncStream(
+            ws_url=account.ws_url,
+            api_key=self._api_key,
+            platform=account.platform,
+            verify=self.verify_terminal_tls if verify is None else verify,
+            auto_reconnect=auto_reconnect,
+        )
 
     async def aclose(self) -> None:
         try:
