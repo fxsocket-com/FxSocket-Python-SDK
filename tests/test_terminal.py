@@ -299,6 +299,48 @@ def test_order_send_allows_stop_limit_on_mt4() -> None:
     assert sent["stopLimitPrice"] == 1.09
 
 
+@respx.mock
+def test_order_modify_no_change_is_effective() -> None:
+    # An idempotent re-send (SL/TP already match) returns retcode 10025 with
+    # success=False; outcome distinguishes the benign no-op from a rejection,
+    # and is_effective treats it as "requested state is in effect".
+    respx.post(f"{TERM}/OrderModify").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": False,
+                "outcome": "no_change",
+                "retcode": 10025,
+                "retcodeDescription": "No changes",
+                "deal": 0,
+                "order": 100,
+                "volume": 0.1,
+                "price": 0.0,
+                "bid": 1.0849,
+                "ask": 1.0851,
+                "comment": "No changes",
+            },
+        ),
+    )
+    with _term() as t:
+        res = t.order_modify(100, stop_loss=1.07)
+    assert res.success is False
+    assert res.outcome == "no_change"
+    assert res.is_no_change is True
+    assert res.is_effective is True
+
+
+def test_order_result_outcome_absent_defaults_empty() -> None:
+    # Bridges older than MT5 0.6.1 / MT4 0.5.1 omit `outcome` — it must default
+    # to "" (backward-compatible), not fail validation.
+    from fxsocket import OrderResult
+
+    res = OrderResult.model_validate(_ORDER_OK)
+    assert res.outcome == ""
+    assert res.success is True
+    assert res.is_effective is True
+
+
 def test_order_send_rejects_nonpositive_volume() -> None:
     from fxsocket import ValidationError
 

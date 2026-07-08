@@ -61,6 +61,21 @@ PENDING_OPERATIONS = frozenset(
 )
 
 
+class OrderOutcome(str, Enum):
+    """Semantic classification of a trade result (``OrderResult.outcome``).
+
+    ``success`` only tells you applied-or-not; ``outcome`` additionally
+    separates a benign no-op and a partial fill from a genuine rejection, so
+    clients don't have to hardcode retcode tables. Empty on bridges older than
+    MT5 0.6.1 / MT4 0.5.1.
+    """
+
+    APPLIED = "applied"       #: retcode 10009 (done) / 10008 (placed)
+    NO_CHANGE = "no_change"   #: retcode 10025 — requested state already in effect
+    PARTIAL = "partial"       #: retcode 10010 (done partially)
+    REJECTED = "rejected"     #: anything else — inspect ``retcode`` / ``comment``
+
+
 class OrderKind(str, Enum):
     """Whether an opened row is a live position or a resting pending order."""
 

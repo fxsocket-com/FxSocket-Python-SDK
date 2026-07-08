@@ -24,7 +24,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
-from .enums import Platform, TradingStatus
+from .enums import OrderOutcome, Platform, TradingStatus
 
 
 class _Camel(BaseModel):
@@ -257,12 +257,23 @@ class Candle(_Camel):
 class OrderResult(_Camel):
     """Result of an order send / modify / close.
 
-    ``success`` is true when ``retcode`` is DONE (10009) or PLACED (10010).
+    ``success`` is true when ``retcode`` is DONE (10009) or PLACED (10008).
+
+    ``outcome`` classifies the result further — ``"applied"`` /
+    ``"no_change"`` / ``"partial"`` / ``"rejected"`` (compare against
+    :class:`fxsocket.OrderOutcome`). ``"no_change"`` (retcode 10025) is a
+    benign idempotent no-op — the requested SL/TP/price already match the
+    current values — so it is safe to treat as applied even though ``success``
+    is ``False``. Use :attr:`is_effective` when you only care that the
+    requested state is in effect (the idempotent-retry case). ``outcome`` is
+    empty on bridges older than MT5 0.6.1 / MT4 0.5.1.
+
     ``deal`` is the executed deal ticket (0 for pending placement, and always
     0 on MT4); ``order`` is the resulting position / pending-order ticket.
     """
 
     success: bool
+    outcome: str = ""
     retcode: int
     retcode_description: str
     deal: int
@@ -272,6 +283,20 @@ class OrderResult(_Camel):
     bid: float
     ask: float
     comment: str
+
+    @property
+    def is_no_change(self) -> bool:
+        """True for a benign no-op (retcode 10025 / ``outcome == "no_change"``):
+        the requested SL/TP/price already match the current values."""
+        return self.retcode == 10025 or self.outcome == OrderOutcome.NO_CHANGE
+
+    @property
+    def is_effective(self) -> bool:
+        """True when the requested state is in effect — either ``success``
+        (applied) or a no-op (:attr:`is_no_change`). Use this for idempotent
+        SL/TP management, where re-sending an identical modify returns 10025
+        with ``success=False``."""
+        return self.success or self.is_no_change
 
 
 class MarginCalc(_Camel):

@@ -111,6 +111,23 @@ with Client(api_key="fxs_live_…") as fx:
         term.order_close(result.order)
 ```
 
+Every order call returns an `OrderResult`. A `200` only means the terminal
+answered — check the body: `success` is true for `retcode` `10009` (done) or
+`10008` (placed), and `outcome` classifies the result as `applied` /
+`no_change` / `partial` / `rejected` (compare against `OrderOutcome`).
+
+`no_change` (retcode `10025`) is a benign, idempotent no-op — the requested
+SL/TP/price already match — so it's safe to treat as applied even though
+`success` is `False`. For idempotent SL/TP management (e.g. re-sending after a
+lost confirmation), send absolute values and gate on `result.is_effective`
+(true for both `applied` and `no_change`):
+
+```python
+res = term.order_modify(ticket, stop_loss=1.0850)
+if res.is_effective:        # applied now, or already in effect
+    ...
+```
+
 Inputs are validated client-side before they're sent. One guard worth knowing:
 in `order_modify`, a literal `stop_loss=0.0` would *remove* your stop-loss, so
 it's rejected — pass `clear_stop_loss=True` to remove one deliberately, while
