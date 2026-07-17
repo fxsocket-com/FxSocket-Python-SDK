@@ -74,6 +74,24 @@ class DuplicateAccountError(FxSocketError):
     """This account is already linked (HTTP 409)."""
 
 
+class SlotsFullError(FxSocketError):
+    """Every purchased slot on the private server is taken (HTTP 409
+    ``slots_full``). Raise the server's limit from the dashboard."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        used: int | None = None,
+        cap: int | None = None,
+        **kw: Any,
+    ):
+        super().__init__(message, **kw)
+        self.used = used
+        self.cap = cap
+
+
+
 class ConnectFailedError(FxSocketError):
     """The broker rejected the login during account creation (HTTP 400).
 
@@ -145,6 +163,10 @@ def error_from_response(resp: httpx.Response) -> FxSocketError:
     if status == 404:
         return NotFoundError(message, **common)
     if status == 409:
+        if code == "slots_full" and isinstance(body, dict):
+            return SlotsFullError(
+                message, used=body.get("used"), cap=body.get("cap"), **common
+            )
         return DuplicateAccountError(message, **common)
     if status == 402:
         if code == "account_cap_reached" and isinstance(body, dict):

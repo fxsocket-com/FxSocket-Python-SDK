@@ -13,6 +13,8 @@ interfaces.
 ## Features
 
 - **Account management** — link, list, fetch, and disconnect MT4/MT5 accounts.
+- **Private servers** — list your dedicated hosting servers and manage the
+  accounts on them.
 - **Trading** — market & pending orders, modify, close, plus margin/profit calculators.
 - **Market data** — quotes, symbol specifications, OHLC history, account state & info.
 - **Live streaming** — ticks, bars, account, positions, trades, and terminal status
@@ -211,11 +213,41 @@ except AccountCapError as e:
 
 ## Private hosting
 
-Privately-hosted accounts (a dedicated droplet) are listed, traded, and streamed
-exactly like shared-cluster accounts — their `rest_url` / `ws_url` simply point
-at the droplet. The droplet serves a self-signed certificate, so reach it with
-`Client(..., verify_terminal_tls=False)` (or supply a pinned CA). *Creating* a
-private-hosted account is done in the dashboard.
+Dedicated private servers are managed through `client.private_servers`:
+
+```python
+import time
+
+from fxsocket import Client, PrivateAccountStatus, SlotsFullError
+
+with Client(api_key="fxs_live_...", verify_terminal_tls=False) as fx:
+    [server] = fx.private_servers.list()
+    print(server.name, server.status, f"{server.used_slots}/{server.purchased_slots}")
+
+    try:
+        account = fx.private_servers.add_account(
+            server, server="ICMarkets-Demo", login=1150125, password="..."
+        )
+    except SlotsFullError as err:
+        print(f"Server full ({err.used}/{err.cap}) — raise the limit in the dashboard.")
+
+    # Poll until the on-server agent has the terminal up, then trade as usual.
+    while True:
+        server = fx.private_servers.get(server)
+        account = next(a for a in server.accounts if a.id == account.id)
+        if account.status == PrivateAccountStatus.READY:
+            break
+        time.sleep(5)
+
+    print(fx.terminal(account).account_summary())
+```
+
+Accounts on a private server are traded and streamed exactly like
+shared-cluster accounts — their `rest_url` / `ws_url` simply point at the
+server's dedicated IP. The server presents a self-signed certificate, so reach
+it with `Client(..., verify_terminal_tls=False)` (or supply a pinned CA).
+*Purchasing* a server, canceling, and slot changes happen in the dashboard;
+the API deliberately exposes no billing operations.
 
 ## Timestamps
 

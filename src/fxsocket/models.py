@@ -70,6 +70,67 @@ class Account(BaseModel):
         return bool(self.rest_url)
 
 
+class PrivateServerAccount(BaseModel):
+    """An MT4/MT5 account living on a private server (v1 API).
+
+    ``status`` is the private-hosting lifecycle — compare against
+    :class:`fxsocket.PrivateAccountStatus` (provisioning / ready / error /
+    expired). ``rest_url`` / ``ws_url`` are the account's terminal API on
+    the server's dedicated IP. Private servers use a self-signed TLS
+    certificate, so pass ``verify=False`` (or construct the client with
+    ``verify_terminal_tls=False``) when calling ``client.terminal(...)``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: str
+    nickname: str = ""
+    platform: Platform
+    server: str
+    login: int
+    status: str
+    rest_url: str = ""
+    ws_url: str = ""
+    trade_ea_symbol: str = ""
+    created_at: datetime
+
+    @property
+    def has_terminal(self) -> bool:
+        """True when this account exposes a reachable terminal API."""
+        return bool(self.rest_url)
+
+
+class PrivateServer(BaseModel):
+    """A dedicated private hosting server (v1 API).
+
+    ``status`` is the server lifecycle — compare against
+    :class:`fxsocket.PrivateServerStatus`. ``purchased_slots`` is the paid
+    limit; ``used_slots`` how many accounts currently live on the server.
+    Purchasing, canceling and slot changes happen in the dashboard, not
+    the API.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: str
+    name: str = ""
+    status: str
+    region: str = ""
+    ip: str = ""
+    purchased_slots: int = 0
+    used_slots: int = 0
+    period_end: datetime | None = None
+    accounts: list[PrivateServerAccount] = []
+
+    @property
+    def is_ready(self) -> bool:
+        return self.status == "ready"
+
+    @property
+    def free_slots(self) -> int:
+        return max(self.purchased_slots - self.used_slots, 0)
+
+
 # --------------------------------------------------------------------------- #
 # Terminal — account state
 # --------------------------------------------------------------------------- #

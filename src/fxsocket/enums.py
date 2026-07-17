@@ -76,6 +76,25 @@ class OrderOutcome(str, Enum):
     REJECTED = "rejected"     #: anything else — inspect ``retcode`` / ``comment``
 
 
+class PrivateServerStatus(str, Enum):
+    """Lifecycle of a private hosting server (v1 ``status``)."""
+
+    PENDING_PAYMENT = "pending_payment"
+    PROVISIONING = "provisioning"
+    READY = "ready"
+    RESIZING = "resizing"
+    EXPIRED = "expired"
+
+
+class PrivateAccountStatus(str, Enum):
+    """Lifecycle of an account living on a private server (v1 ``status``)."""
+
+    PROVISIONING = "provisioning"
+    READY = "ready"
+    ERROR = "error"
+    EXPIRED = "expired"
+
+
 class OrderKind(str, Enum):
     """Whether an opened row is a live position or a resting pending order."""
 

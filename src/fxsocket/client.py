@@ -15,8 +15,13 @@ import httpx
 from ._http import AsyncHTTP, SyncHTTP, auth_headers
 from .config import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, ENV_API_KEY
 from .errors import AuthError, TerminalNotReadyError
-from .management import Accounts, AsyncAccounts
-from .models import Account
+from .management import (
+    Accounts,
+    AsyncAccounts,
+    AsyncPrivateServers,
+    PrivateServers,
+)
+from .models import Account, PrivateServerAccount
 from .terminal.client import AsyncTerminalClient, TerminalClient
 from .terminal.stream import AsyncStream, Stream
 
@@ -63,11 +68,13 @@ class Client:
         )
         #: Account management (the v1 API).
         self.accounts = Accounts(SyncHTTP(self._http_client))
+        #: Private hosting servers (the v1 API).
+        self.private_servers = PrivateServers(SyncHTTP(self._http_client))
         self._terminals: dict[tuple[str, str], TerminalClient] = {}
 
     def terminal(
         self,
-        account: Account,
+        account: Account | PrivateServerAccount,
         *,
         verify: bool | None = None,
         timeout: float | None = None,
@@ -100,7 +107,7 @@ class Client:
 
     def stream(
         self,
-        account: Account,
+        account: Account | PrivateServerAccount,
         *,
         verify: bool | None = None,
         auto_reconnect: bool = True,
@@ -178,11 +185,12 @@ class AsyncClient:
             timeout=timeout,
         )
         self.accounts = AsyncAccounts(AsyncHTTP(self._http_client))
+        self.private_servers = AsyncPrivateServers(AsyncHTTP(self._http_client))
         self._terminals: dict[tuple[str, str], AsyncTerminalClient] = {}
 
     def terminal(
         self,
-        account: Account,
+        account: Account | PrivateServerAccount,
         *,
         verify: bool | None = None,
         timeout: float | None = None,
@@ -212,7 +220,7 @@ class AsyncClient:
 
     def stream(
         self,
-        account: Account,
+        account: Account | PrivateServerAccount,
         *,
         verify: bool | None = None,
         auto_reconnect: bool = True,
