@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 from .enums import OrderOutcome, Platform, TradingStatus
@@ -271,8 +271,65 @@ class Quote(_Camel):
     volume: int
 
 
+class CommissionTier(_Camel):
+    """One tier of a commission rule — a value and the volume/turnover range
+    it applies to.
+
+    Enum-like fields (``mode``, ``volume_type``) carry the raw MQL5 constant
+    names (e.g. ``SYMBOL_COMMISSION_MODE_MONEY``) so nothing is lost in
+    translation. ``range_to == 0`` means unbounded; ``min_value`` /
+    ``max_value`` cap the charged amount (0 = no cap).
+    """
+
+    mode: str
+    volume_type: str
+    value: float
+    min_value: float
+    max_value: float
+    range_from: float
+    range_to: float
+    currency: str
+
+
+class CommissionRule(_Camel):
+    """One broker commission rule for a symbol, as configured server-side
+    (MT5 ``SymbolInfoCommissions``).
+
+    A symbol can carry several rules; each has its own tiers. The mode fields
+    carry the MQL5 ``ENUM_SYMBOL_COMMISSION_*`` constant names verbatim.
+    """
+
+    currency: str
+    range_mode: str
+    charge_mode: str
+    entry_mode: str
+    direction_mode: str
+    profit_mode: str
+    tiers: list[CommissionTier] = []
+
+
+class TradingSession(_Camel):
+    """One trading-session window of a symbol, in *broker server time*.
+
+    ``day`` uses the MQL ``ENUM_DAY_OF_WEEK`` constant names (``SUNDAY`` …
+    ``SATURDAY``); times are ``HH:MM`` where ``24:00`` means end of day, so a
+    24-hour market shows ``00:00``–``24:00``.
+    """
+
+    day: str
+    from_: str = Field(alias="from")
+    to: str
+
+
 class SymbolInfo(_Camel):
-    """Contract specification for a symbol (``GET /SymbolInfo``)."""
+    """Contract specification for a symbol (``GET /SymbolInfo``).
+
+    ``commissions`` are the broker's commission rules straight from the
+    server's symbol specification; ``sessions`` are the per-weekday trading
+    windows in broker server time. Both default to empty on pods older than
+    bridge 0.10 (and ``commissions`` also when the broker publishes none or
+    the terminal predates the API — build 6060+).
+    """
 
     symbol: str
     description: str
@@ -295,6 +352,8 @@ class SymbolInfo(_Camel):
     currency_base: str
     currency_profit: str
     currency_margin: str
+    commissions: list[CommissionRule] = []
+    sessions: list[TradingSession] = []
 
 
 class Candle(_Camel):
@@ -360,6 +419,39 @@ class OrderResult(_Camel):
         return self.success or self.is_no_change
 
 
+class CloseAllResult(_Camel):
+    """One per-ticket outcome of a ``/CloseAll`` pass.
+
+    ``kind`` is ``"position"`` (closed) or ``"pending"`` (deleted).
+    """
+
+    ticket: int
+    kind: str
+    success: bool
+    retcode: int
+    retcode_description: str
+
+    @property
+    def is_pending(self) -> bool:
+        """True when this row is a deleted pending order (vs. a closed position)."""
+        return self.kind.lower() == "pending"
+
+
+class CloseAllSummary(_Camel):
+    """Reply of ``POST /CloseAll`` — every matched position (and pending
+    order, when ``delete_pending`` was set) with its close/delete outcome.
+
+    ``requested`` is how many orders the filters matched and were attempted;
+    ``closed`` how many attempts the broker accepted; ``failed`` how many it
+    rejected — inspect ``results`` for the per-ticket retcodes.
+    """
+
+    requested: int
+    closed: int
+    failed: int
+    results: list[CloseAllResult] = []
+
+
 class MarginCalc(_Camel):
     """Required margin for a hypothetical order (``GET /OrderCalcMargin``)."""
 
@@ -411,8 +503,17 @@ class AccountHealth(_Camel):
 
 
 class BridgeHealth(_Camel):
+    """Bridge section of ``/status``.
+
+    ``trade_ea_heartbeat_age_ms`` is how long ago the trade EA last made
+    dispatcher progress (``-1`` = never registered, or a pod older than
+    bridge 0.10). A large age while ``trade_ea_ready`` is still ``True``
+    means the EA is blocked in a long dealer call or dead — worth alerting on.
+    """
+
     version: str = ""
     trade_ea_ready: bool = False
+    trade_ea_heartbeat_age_ms: int = -1
     symbols_synced: bool = False
 
 

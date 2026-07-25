@@ -15,8 +15,9 @@ interfaces.
 - **Account management** — link, list, fetch, and disconnect MT4/MT5 accounts.
 - **Private servers** — list your dedicated hosting servers and manage the
   accounts on them.
-- **Trading** — market & pending orders, modify, close, plus margin/profit calculators.
-- **Market data** — quotes, symbol specifications, OHLC history, account state & info.
+- **Trading** — market & pending orders, modify, close, close-all, plus margin/profit calculators.
+- **Market data** — quotes, symbol specifications (incl. commission rules & trading
+  sessions), OHLC history, account state & info.
 - **Live streaming** — ticks, bars, account, positions, trades, and terminal status
   over WebSocket, with automatic reconnect + subscription replay.
 - **Sync *and* async** — `Client` / `AsyncClient`, method-for-method mirrors.
@@ -128,6 +129,21 @@ lost confirmation), send absolute values and gate on `result.is_effective`
 res = term.order_modify(ticket, stop_loss=1.0850)
 if res.is_effective:        # applied now, or already in effect
     ...
+```
+
+There's also a panic button. `close_all()` closes every open position in one
+trade-EA pass — optionally filtered by `symbol` and/or `magic` (`magic=0`
+matches manually-opened orders), and `delete_pending=True` also deletes
+matching pending orders. It returns a `CloseAllSummary` with per-ticket
+results. On a 504 the pass *continues inside the terminal* — check
+`opened_orders()` before acting again rather than re-sending:
+
+```python
+summary = term.close_all(symbol="EURUSD", delete_pending=True)
+if summary.failed:
+    for r in summary.results:
+        if not r.success:
+            print(r.ticket, r.retcode, r.retcode_description)
 ```
 
 Inputs are validated client-side before they're sent. One guard worth knowing:

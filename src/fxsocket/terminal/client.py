@@ -46,6 +46,7 @@ from ..models import (
     AccountInfo,
     AccountSummary,
     Candle,
+    CloseAllSummary,
     Health,
     HealthChecks,
     HistoryTrade,
@@ -230,6 +231,20 @@ def _order_send_body(
             "expiration": _fmt_time(expiration),
             "comment": comment,
             "expertId": magic,
+        }
+    )
+
+
+def _close_all_body(
+    *, symbol: str | None, magic: int | None, delete_pending: bool
+) -> dict[str, Any]:
+    # magic=0 is a real filter (manually-opened orders) — only None is omitted.
+    # An empty dict is a valid body: it means "close everything".
+    return _clean(
+        {
+            "symbol": symbol,
+            "magic": magic,
+            "deletePending": True if delete_pending else None,
         }
     )
 
@@ -481,6 +496,32 @@ class TerminalClient:
             self._http.request("POST", "/OrderClose", json=body)
         )
 
+    def close_all(
+        self,
+        *,
+        symbol: str | None = None,
+        magic: int | None = None,
+        delete_pending: bool = False,
+    ) -> CloseAllSummary:
+        """Close every open position in one trade-EA pass (``POST /CloseAll``).
+
+        Optionally filtered by ``symbol`` and/or ``magic`` (``magic=0``
+        matches manually-opened orders; ``None`` means no filter);
+        ``delete_pending=True`` also deletes matching pending orders. The
+        reply carries a per-ticket result for every attempted close/delete.
+
+        Positions opened while the pass is running are not covered, and on a
+        504 (:class:`~fxsocket.TerminalTimeoutError`) the pass *continues to
+        completion inside the terminal* — check :meth:`opened_orders` before
+        acting again rather than re-sending.
+        """
+        body = _close_all_body(
+            symbol=symbol, magic=magic, delete_pending=delete_pending
+        )
+        return CloseAllSummary.model_validate(
+            self._http.request("POST", "/CloseAll", json=body)
+        )
+
     # -- health ------------------------------------------------------------ #
 
     def status(self) -> Health:
@@ -730,6 +771,21 @@ class AsyncTerminalClient:
         body = _clean({"ticket": ticket, "volume": volume, "slippage": slippage})
         return OrderResult.model_validate(
             await self._http.request("POST", "/OrderClose", json=body)
+        )
+
+    async def close_all(
+        self,
+        *,
+        symbol: str | None = None,
+        magic: int | None = None,
+        delete_pending: bool = False,
+    ) -> CloseAllSummary:
+        """Async mirror of :meth:`TerminalClient.close_all`."""
+        body = _close_all_body(
+            symbol=symbol, magic=magic, delete_pending=delete_pending
+        )
+        return CloseAllSummary.model_validate(
+            await self._http.request("POST", "/CloseAll", json=body)
         )
 
     async def status(self) -> Health:

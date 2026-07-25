@@ -212,6 +212,22 @@ def test_status_nested_health() -> None:
     assert h.terminal.ping_ms == 108
     assert h.account.logged_in is True
     assert h.bridge.trade_ea_ready is True
+    # Pre-0.10 bridges omit the heartbeat — defaults to -1 (never/unknown).
+    assert h.bridge.trade_ea_heartbeat_age_ms == -1
+
+
+def test_bridge_health_heartbeat_parses() -> None:
+    from fxsocket.models import BridgeHealth
+
+    b = BridgeHealth.model_validate(
+        {
+            "version": "0.10.0",
+            "tradeEaReady": True,
+            "tradeEaHeartbeatAgeMs": 8,
+            "symbolsSynced": True,
+        }
+    )
+    assert b.trade_ea_heartbeat_age_ms == 8
 
 
 # --------------------------------------------------------------------------- #
@@ -430,6 +446,76 @@ def test_order_modify_omits_unset_fields() -> None:
     }
 
 
+@respx.mock
+def test_close_all_sends_filters_and_parses() -> None:
+    route = respx.post(f"{TERM}/CloseAll").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "requested": 2,
+                "closed": 1,
+                "failed": 1,
+                "results": [
+                    {
+                        "ticket": 100,
+                        "kind": "position",
+                        "success": True,
+                        "retcode": 10009,
+                        "retcodeDescription": "Done",
+                    },
+                    {
+                        "ticket": 101,
+                        "kind": "pending",
+                        "success": False,
+                        "retcode": 10006,
+                        "retcodeDescription": "Rejected",
+                    },
+                ],
+            },
+        )
+    )
+    with _term() as t:
+        summary = t.close_all(symbol="EURUSD", magic=0, delete_pending=True)
+    # magic=0 is a real filter (manual orders) and must be sent, not dropped.
+    assert json.loads(route.calls.last.request.content) == {
+        "symbol": "EURUSD",
+        "magic": 0,
+        "deletePending": True,
+    }
+    assert (summary.requested, summary.closed, summary.failed) == (2, 1, 1)
+    assert [r.is_pending for r in summary.results] == [False, True]
+    assert summary.results[1].retcode_description == "Rejected"
+
+
+@respx.mock
+def test_close_all_no_filters_sends_empty_json_body() -> None:
+    # /CloseAll requires a JSON body; with no filters it must be exactly {}.
+    route = respx.post(f"{TERM}/CloseAll").mock(
+        return_value=httpx.Response(
+            200, json={"requested": 0, "closed": 0, "failed": 0, "results": []}
+        )
+    )
+    with _term() as t:
+        summary = t.close_all()
+    req = route.calls.last.request
+    assert json.loads(req.content) == {}
+    assert req.headers["content-type"] == "application/json"
+    assert summary.requested == 0 and summary.results == []
+
+
+@respx.mock
+def test_close_all_504_maps_to_timeout() -> None:
+    # The pass continues inside the terminal after a 504 — the SDK must
+    # surface the timeout (never retry), so callers re-check /OpenedOrders.
+    respx.post(f"{TERM}/CloseAll").mock(
+        return_value=httpx.Response(
+            504, json={"error": "MRPC_TIMEOUT", "message": "timed out", "command_id": 3}
+        )
+    )
+    with _term() as t, pytest.raises(TerminalTimeoutError):
+        t.close_all()
+
+
 # --------------------------------------------------------------------------- #
 # Health probes — 503 carries a body, not an error
 # --------------------------------------------------------------------------- #
@@ -552,6 +638,46 @@ def test_symbol_info_parses_camelcase() -> None:
     assert si.tick_size == 0.00001
     assert si.volume_min == 0.01
     assert si.currency_base == "EUR"
+    # Pods older than bridge 0.10 omit commissions/sessions — default empty.
+    assert si.commissions == [] and si.sessions == []
+
+
+def test_symbol_info_commissions_and_sessions_parse() -> None:
+    from fxsocket import CommissionRule, TradingSession
+
+    rule = CommissionRule.model_validate(
+        {
+            "currency": "USD",
+            "rangeMode": "SYMBOL_COMMISSION_RANGE_VOLUME",
+            "chargeMode": "SYMBOL_COMMISSION_CHARGE_INSTANT",
+            "entryMode": "SYMBOL_COMMISSION_ENTRY_INOUT",
+            "directionMode": "SYMBOL_COMMISSION_DIRECTION_BOTH",
+            "profitMode": "SYMBOL_COMMISSION_PROFIT_ALL",
+            "tiers": [
+                {
+                    "mode": "SYMBOL_COMMISSION_MONEY_DEPOSIT",
+                    "volumeType": "SYMBOL_COMMISSION_VOLUME_TYPE_VOLUME",
+                    "value": 3.5,
+                    "minValue": 0.0,
+                    "maxValue": 0.0,
+                    "rangeFrom": 0.0,
+                    "rangeTo": 1000000.0,
+                    "currency": "USD",
+                }
+            ],
+        }
+    )
+    assert rule.range_mode == "SYMBOL_COMMISSION_RANGE_VOLUME"
+    assert rule.tiers[0].value == 3.5
+    assert rule.tiers[0].range_to == 1000000.0
+
+    # `from` is a Python keyword — the wire field maps to `from_`.
+    session = TradingSession.model_validate(
+        {"day": "FRIDAY", "from": "00:01", "to": "23:57"}
+    )
+    assert session.day == "FRIDAY"
+    assert session.from_ == "00:01"
+    assert session.to == "23:57"
 
 
 @respx.mock
@@ -721,3 +847,31 @@ async def test_async_order_send_body_and_validation() -> None:
         "volume": 0.2,
         "expertId": 7,
     }
+
+
+@respx.mock
+async def test_async_close_all() -> None:
+    route = respx.post(f"{TERM}/CloseAll").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "requested": 1,
+                "closed": 1,
+                "failed": 0,
+                "results": [
+                    {
+                        "ticket": 100,
+                        "kind": "position",
+                        "success": True,
+                        "retcode": 10009,
+                        "retcodeDescription": "Done",
+                    }
+                ],
+            },
+        )
+    )
+    async with AsyncClient(api_key="fxs_live_k") as fx:
+        term = fx.terminal(_account())
+        summary = await term.close_all(symbol="EURUSD")
+    assert json.loads(route.calls.last.request.content) == {"symbol": "EURUSD"}
+    assert summary.closed == 1 and summary.results[0].success
