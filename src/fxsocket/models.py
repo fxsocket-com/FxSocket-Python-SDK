@@ -205,10 +205,20 @@ class HistoryTrade(_Camel):
 
     On MT4 this is one row per closed *order* (no per-deal granularity);
     ``order`` aliases the ticket and ``entry`` is constant.
+
+    ``position`` groups the rows of one round-trip: on MT5 it is the deal's
+    ``DEAL_POSITION_ID`` — the ``In`` and ``Out`` rows share it, and it
+    equals the ``trades``-stream events' ``position`` and
+    :attr:`PositionTrade.position_id` — so an exit row alone identifies the
+    position it closed even though MT5 exits usually carry ``magic=0`` /
+    ``comment=""``. On MT4 it equals the order ticket. 0 on pods older than
+    bridge MT5 0.14 / MT4 0.13. (Netting-account caveat: a reversal
+    ``InOut`` row reports the position it belongs to *after* processing.)
     """
 
     ticket: int
     order: int
+    position: int = 0
     symbol: str
     type: str
     entry: str
@@ -553,8 +563,29 @@ class HealthChecks(_Camel):
 class TradeEventData(_Camel):
     """A trade transaction pushed on the ``trades`` stream.
 
-    ``deal`` / ``position`` are 0 on MT4 (no per-deal model); ``entry`` is the
-    deal direction (compare against :class:`fxsocket.DealEntry`).
+    ``entry`` is the deal direction (compare against
+    :class:`fxsocket.DealEntry`; ``"Unknown"`` appears only on degraded
+    frames). ``commission`` / ``swap`` / ``magic`` (and a real ``comment`` on
+    MT5) arrive on bridges MT5 0.12+ / MT4 0.11+ and default to 0 before
+    that; a deal's net P&L is ``profit + commission + swap``
+    (:attr:`net_profit`).
+
+    Platform semantics:
+
+    * **MT5** — ``Out`` deals carry ``magic=0`` / ``comment=""`` unless the
+      closing request set them (a platform property, not a bridge gap).
+      Correlate ``In``/``Out`` through ``position``, which is present on
+      every event.
+    * **MT4** — orders keep their magic/comment for the whole lifecycle, so
+      both ``In`` and ``Out`` events carry them; ``deal`` is always 0 and
+      ``position`` equals the order ticket.
+
+    ``degraded=True`` (bridges MT5 0.13+ / MT4 0.12+; structurally always
+    ``False`` on MT4) means the bridge could not fully enrich the event in
+    time: the identifiers, ``symbol``, ``type``, ``volume`` and ``price`` are
+    trustworthy, but ``entry`` is ``"Unknown"`` and ``profit`` /
+    ``commission`` / ``swap`` / ``magic`` / ``comment`` are zeroed —
+    reconcile the deal via ``GET /OrderHistory``.
     """
 
     deal: int
@@ -566,8 +597,17 @@ class TradeEventData(_Camel):
     volume: float
     price: float
     profit: float
+    commission: float = 0.0
+    swap: float = 0.0
+    magic: int = 0
     comment: str
     time: str
+    degraded: bool = False
+
+    @property
+    def net_profit(self) -> float:
+        """Deal P&L including costs: ``profit + commission + swap``."""
+        return self.profit + self.commission + self.swap
 
 
 class TerminalStatusData(_Camel):

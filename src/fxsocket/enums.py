@@ -103,11 +103,17 @@ class OrderKind(str, Enum):
 
 
 class DealEntry(str, Enum):
-    """Direction of a deal in trade history / the ``trades`` stream."""
+    """Direction of a deal in trade history / the ``trades`` stream.
+
+    ``UNKNOWN`` appears only on degraded ``trades``-stream frames, where the
+    bridge could not resolve the deal direction in time — see
+    ``TradeEventData.degraded``.
+    """
 
     IN = "In"
     OUT = "Out"
     IN_OUT = "InOut"
+    UNKNOWN = "Unknown"
 
 
 class HealthStatus(str, Enum):

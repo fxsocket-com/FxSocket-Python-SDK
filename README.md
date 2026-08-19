@@ -202,6 +202,35 @@ with Client(api_key="fxs_live_…") as fx:
                 print(event.data.bid, event.data.ask)
 ```
 
+### Trade events
+
+A `TradeUpdate` carries the full deal: `commission`, `swap`, `magic` and a
+real `comment` alongside `profit` (bridges MT5 0.12+ / MT4 0.11+; zero on
+older pods). Event-only P&L accounting is `data.net_profit`
+(`profit + commission + swap`).
+
+Correlate the `In` and `Out` events of one round-trip through
+`data.position` — on MT5, `Out` deals carry `magic=0` / `comment=""` unless
+the closing request set them (platform behavior, not a bridge gap), so
+position id is the reliable join key. On MT4, `deal` is always 0 and
+`position` equals the order ticket. The same id appears as `position` in
+`order_history()` rows (bridges MT5 0.14+ / MT4 0.13+) and as
+`position_id` in `position_history()`.
+
+If the bridge can't fully enrich an event in time it sets
+`data.degraded=True`: identifiers, `symbol`, `type`, `volume` and `price`
+are still trustworthy, but `entry` is `"Unknown"` and the cost fields are
+zeroed — reconcile that deal via `order_history()`.
+
+```python
+async for event in s:
+    match event:
+        case TradeUpdate() as t if t.data.degraded:
+            reconcile_later(t.data.position)     # costs/entry unreliable
+        case TradeUpdate() as t if t.data.entry == DealEntry.OUT:
+            print(t.data.position, "closed, net", t.data.net_profit)
+```
+
 ## Errors
 
 Every failure raises a subclass of `fxsocket.FxSocketError`:

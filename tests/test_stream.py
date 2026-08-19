@@ -13,6 +13,7 @@ from fxsocket import (
     AccountUpdate,
     AsyncStream,
     Bar,
+    DealEntry,
     PositionsUpdate,
     Stream,
     StreamWarning,
@@ -157,12 +158,19 @@ def test_parse_event_all_types() -> None:
                 "volume": 0.1,
                 "price": 1.0,
                 "profit": 0.0,
-                "comment": "",
+                "commission": -0.04,
+                "swap": 0.0,
+                "magic": 1000999,
+                "comment": "CN_9999_8888",
                 "time": "t",
+                "degraded": False,
             },
         }
     )
     assert isinstance(trade, TradeUpdate) and trade.data.entry == "In"
+    assert trade.data.commission == -0.04 and trade.data.magic == 1000999
+    assert trade.data.degraded is False
+    assert trade.data.net_profit == pytest.approx(-0.04)
 
     term = parse_event(
         {
@@ -190,6 +198,61 @@ def test_parse_event_all_types() -> None:
         StreamErrorEvent,
     )
     assert isinstance(parse_event({"type": "subscriptions", "data": []}), Subscriptions)
+
+
+def test_parse_trade_pre_012_bridge_defaults() -> None:
+    """Bridges older than MT5 0.12 / MT4 0.11 omit the enrichment fields."""
+    trade = parse_event(
+        {
+            "type": "trade",
+            "data": {
+                "deal": 9,
+                "order": 10,
+                "position": 10,
+                "symbol": "EURUSD",
+                "type": "Buy",
+                "entry": "In",
+                "volume": 0.1,
+                "price": 1.0,
+                "profit": 0.0,
+                "comment": "",
+                "time": "t",
+            },
+        }
+    )
+    assert isinstance(trade, TradeUpdate)
+    assert trade.data.commission == 0.0 and trade.data.swap == 0.0
+    assert trade.data.magic == 0 and trade.data.degraded is False
+
+
+def test_parse_trade_degraded_frame() -> None:
+    """A degraded frame: identifiers/direction real, costs zeroed, entry Unknown."""
+    trade = parse_event(
+        {
+            "type": "trade",
+            "data": {
+                "deal": 9,
+                "order": 10,
+                "position": 10,
+                "symbol": "EURUSD",
+                "type": "Buy",
+                "entry": "Unknown",
+                "volume": 0.1,
+                "price": 1.0,
+                "profit": 0.0,
+                "commission": 0.0,
+                "swap": 0.0,
+                "magic": 0,
+                "comment": "",
+                "time": "2026-08-19T18:53:41.000Z",
+                "degraded": True,
+            },
+        }
+    )
+    assert isinstance(trade, TradeUpdate)
+    assert trade.data.degraded is True
+    assert trade.data.entry == DealEntry.UNKNOWN
+    assert trade.data.symbol == "EURUSD" and trade.data.position == 10
 
 
 # --------------------------------------------------------------------------- #

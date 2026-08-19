@@ -694,6 +694,54 @@ def test_server_timezone_parses() -> None:
 
 
 @respx.mock
+def test_order_history_parses_position() -> None:
+    # Second row mimics a pod older than bridge MT5 0.14 / MT4 0.13 (no
+    # ``position`` yet) — must default to 0, not fail validation.
+    respx.get(f"{TERM}/OrderHistory").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "ticket": 14541780,
+                    "order": 13173527,
+                    "position": 13173524,
+                    "symbol": "EURUSD",
+                    "type": "Sell",
+                    "entry": "Out",
+                    "volume": 0.01,
+                    "price": 1.16635,
+                    "profit": -0.02,
+                    "commission": -0.04,
+                    "swap": 0.0,
+                    "magic": 0,
+                    "comment": "",
+                    "time": "2026-08-19T18:53:47.000Z",
+                },
+                {
+                    "ticket": 14541777,
+                    "order": 13173524,
+                    "symbol": "EURUSD",
+                    "type": "Buy",
+                    "entry": "In",
+                    "volume": 0.01,
+                    "price": 1.16637,
+                    "profit": 0.0,
+                    "commission": -0.04,
+                    "swap": 0.0,
+                    "magic": 1000999,
+                    "comment": "CN_9999_8888",
+                    "time": "2026-08-19T18:53:41.000Z",
+                },
+            ],
+        )
+    )
+    with _term() as t:
+        rows = t.order_history()
+    assert rows[0].position == 13173524
+    assert rows[1].position == 0
+
+
+@respx.mock
 def test_position_history_sends_dates_and_parses() -> None:
     route = respx.get(f"{TERM}/PositionHistory").mock(
         return_value=httpx.Response(
