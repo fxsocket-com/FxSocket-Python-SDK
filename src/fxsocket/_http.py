@@ -45,8 +45,11 @@ class SyncHTTP:
         *,
         params: dict[str, Any] | None = None,
         json: Any | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Any:
-        resp = self._client.request(method, path, params=params, json=json)
+        resp = self._client.request(
+            method, path, params=params, json=json, headers=headers
+        )
         return process_response(resp)
 
 
@@ -63,6 +66,9 @@ class AsyncHTTP:
         *,
         params: dict[str, Any] | None = None,
         json: Any | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Any:
-        resp = await self._client.request(method, path, params=params, json=json)
+        resp = await self._client.request(
+            method, path, params=params, json=json, headers=headers
+        )
         return process_response(resp)

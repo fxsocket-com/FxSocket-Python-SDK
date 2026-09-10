@@ -95,6 +95,107 @@ class PrivateAccountStatus(str, Enum):
     EXPIRED = "expired"
 
 
+class KeyScope(str, Enum):
+    """What a named read-only key may see (v1 ``scope``).
+
+    ``ALL`` covers every account; ``SELECTED`` only the accounts attached to
+    the key — everything else is invisible to it (absent from lists, 404 by
+    id, 401 at the terminal).
+    """
+
+    ALL = "all"
+    SELECTED = "selected"
+
+
+class SymbolMatch(str, Enum):
+    """How a multi-account close selector matches symbols.
+
+    ``EXACT`` (the default) matches the symbol exactly as typed. ``BASE``
+    also accepts a broker suffix, so ``EURUSD`` reaches ``EURUSD.sd`` and
+    ``EURUSDm`` — useful when one selector spans brokers that spell an
+    instrument differently. A suffix is separator-led (``.sd``) or at most
+    two alphanumerics (``m``), so ``EUR`` never matches ``EURUSD``.
+    """
+
+    EXACT = "exact"
+    BASE = "base"
+
+
+class CloseSide(str, Enum):
+    """Which direction a multi-account close selector touches."""
+
+    LONG = "long"
+    SHORT = "short"
+    ANY = "any"
+
+
+class CloseKind(str, Enum):
+    """What a multi-account close selector touches.
+
+    ``POSITION`` (the default) closes open positions only, ``PENDING``
+    deletes pending orders only, ``ANY`` does both.
+    """
+
+    POSITION = "position"
+    PENDING = "pending"
+    ANY = "any"
+
+
+class OrderLegStatus(str, Enum):
+    """Outcome of one leg of a multi-account order batch
+    (``OrderLegResult.status``). Only ``FILLED`` means the broker took it.
+
+    ``TIMEOUT`` is *unknown*: the order may well have reached the broker.
+    Never blind-retry one — replay with the same ``idempotency_key`` or
+    reconcile against the account's ``opened_orders()``.
+    """
+
+    FILLED = "filled"          #: the terminal replied and the broker accepted
+    REJECTED = "rejected"      #: the broker refused — ``retcode`` says why
+    INVALID = "invalid"        #: the terminal refused the request itself
+    UNAVAILABLE = "unavailable"  #: terminal up but not trading yet
+    UNREACHABLE = "unreachable"  #: no terminal to talk to
+    TIMEOUT = "timeout"        #: unknown — may or may not have executed
+
+
+class CloseLegStatus(str, Enum):
+    """Outcome for one account of a multi-account close batch
+    (``CloseLegResult.status``).
+
+    ``NOTHING_MATCHED`` is a normal answer, not an error. ``UNAVAILABLE`` /
+    ``UNREACHABLE`` / ``INVALID`` mean the lookup itself failed, so nothing
+    is known about what is open there. ``TIMEOUT`` means orders *may* have
+    closed.
+    """
+
+    CLOSED = "closed"                  #: every matched order closed
+    PARTIAL = "partial"                #: some closed, some did not
+    FAILED = "failed"                  #: orders matched, none closed
+    NOTHING_MATCHED = "nothing_matched"  #: the selector found nothing
+    UNAVAILABLE = "unavailable"
+    UNREACHABLE = "unreachable"
+    TIMEOUT = "timeout"
+    INVALID = "invalid"
+
+
+class ClosedTicketStatus(str, Enum):
+    """Outcome for one ticket of a multi-account close batch
+    (``ClosedTicket.status``).
+
+    ``SKIPPED`` means it was never sent (per-account cap or batch deadline),
+    so it definitely did not close. ``TIMEOUT`` means it was sent and never
+    answered, so it may well have.
+    """
+
+    CLOSED = "closed"
+    REJECTED = "rejected"
+    INVALID = "invalid"
+    UNAVAILABLE = "unavailable"
+    UNREACHABLE = "unreachable"
+    TIMEOUT = "timeout"
+    SKIPPED = "skipped"
+
+
 class OrderKind(str, Enum):
     """Whether an opened row is a live position or a resting pending order."""
 

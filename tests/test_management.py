@@ -11,9 +11,11 @@ from fxsocket import (
     AsyncClient,
     AuthError,
     Client,
+    ConnectFailedError,
     DuplicateAccountError,
     Platform,
     TradingStatus,
+    ValidationError,
 )
 
 BASE = "https://api.fxsocket.com/v1"
@@ -29,6 +31,14 @@ POD_ACCOUNT = {
     "rest_url": "https://api.fxsocket.com/mt5/d04096e8-79cd-4078-bc8c-0fd245198938",
     "ws_url": "wss://api.fxsocket.com/mt5/d04096e8-79cd-4078-bc8c-0fd245198938/ws",
     "created_at": "2026-06-22T16:53:56Z",
+}
+
+PROXIED_ACCOUNT = {
+    **POD_ACCOUNT,
+    "proxy_address": "10.0.0.5:1080",
+    "proxy_type": "socks5",
+    "proxy_local_port": 1080,
+    "trade_ea_symbol": "EURUSDm",
 }
 
 BRIDGE_ACCOUNT = {
@@ -76,6 +86,8 @@ def test_list_accounts_parses_models() -> None:
     assert pod.rest_url.endswith("/mt5/d04096e8-79cd-4078-bc8c-0fd245198938")
     assert bridge.has_terminal is False
     assert bridge.rest_url == ""
+    assert pod.proxy_address == "" and pod.proxy_local_port is None
+    assert pod.trade_ea_symbol == ""
 
 
 @respx.mock
@@ -110,7 +122,93 @@ def test_create_account_posts_payload() -> None:
         "login": 1150125,
         "password": "pw",
         "nickname": "",
+        "trade_ea_symbol": "",
     }
+
+
+@respx.mock
+def test_create_account_with_proxy_and_trade_ea_symbol() -> None:
+    route = respx.post(f"{BASE}/accounts").mock(
+        return_value=httpx.Response(201, json=PROXIED_ACCOUNT)
+    )
+    with _client() as fx:
+        acct = fx.accounts.create(
+            server="ICMarkets-Demo",
+            login=1150125,
+            password="pw",
+            trade_ea_symbol="EURUSDm",
+            proxy_address="10.0.0.5:1080",
+            proxy_type="socks5",
+            proxy_auth="user:secret",
+            proxy_local_port=1080,
+        )
+    import json
+
+    sent = json.loads(route.calls.last.request.content)
+    assert sent == {
+        "platform": "mt5",
+        "server": "ICMarkets-Demo",
+        "login": 1150125,
+        "password": "pw",
+        "nickname": "",
+        "trade_ea_symbol": "EURUSDm",
+        "proxy_address": "10.0.0.5:1080",
+        "proxy_type": "socks5",
+        "proxy_auth": "user:secret",
+        "proxy_local_port": 1080,
+    }
+    assert acct.proxy_address == "10.0.0.5:1080"
+    assert acct.proxy_type == "socks5"
+    assert acct.proxy_local_port == 1080
+    assert acct.trade_ea_symbol == "EURUSDm"
+
+
+def test_create_validates_proxy_arguments() -> None:
+    with _client() as fx:
+        with pytest.raises(ValidationError, match="proxy_address is required"):
+            fx.accounts.create(server="Demo", login=1, password="pw", proxy_type="http")
+        with pytest.raises(ValidationError, match="proxy_local_port"):
+            fx.accounts.create(
+                server="Demo",
+                login=1,
+                password="pw",
+                proxy_address="h:1",
+                proxy_local_port=70000,
+            )
+
+
+@respx.mock
+def test_proxy_unreachable_maps_to_connect_failed() -> None:
+    respx.post(f"{BASE}/accounts").mock(
+        return_value=httpx.Response(
+            400, json={"error": "proxy_unreachable", "detail": "cannot reach proxy"}
+        )
+    )
+    with _client() as fx, pytest.raises(ConnectFailedError) as exc:
+        fx.accounts.create(server="Demo", login=1, password="pw", proxy_address="h:1")
+    assert exc.value.code == "proxy_unreachable"
+
+
+@respx.mock
+def test_update_trade_ea_symbol_patches() -> None:
+    route = respx.patch(f"{BASE}/accounts/{POD_ACCOUNT['id']}").mock(
+        return_value=httpx.Response(
+            200, json={**POD_ACCOUNT, "trade_ea_symbol": "EURUSDm"}
+        )
+    )
+    with _client() as fx:
+        acct = fx.accounts.update(POD_ACCOUNT["id"], trade_ea_symbol="EURUSDm")
+        fx.accounts.update(acct, trade_ea_symbol="")
+    import json
+
+    assert json.loads(route.calls[0].request.content) == {"trade_ea_symbol": "EURUSDm"}
+    assert json.loads(route.calls[1].request.content) == {"trade_ea_symbol": ""}
+    assert acct.trade_ea_symbol == "EURUSDm"
+
+
+def test_update_without_fields_is_rejected() -> None:
+    with _client() as fx, pytest.raises(ValidationError, match="nothing to update"):
+        fx.accounts.update(POD_ACCOUNT["id"])
 
 
 @respx.mock

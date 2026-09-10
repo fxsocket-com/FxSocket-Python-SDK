@@ -2,8 +2,9 @@
 
 Two families:
 
-* The management model (:class:`Account`) — the v1 API, which already speaks
-  ``snake_case`` and returns a genuine UTC ``created_at``.
+* Management models (:class:`Account`, the multi-account trading batch
+  models, :class:`Wallet`) — the v1 API, which already speaks ``snake_case``
+  and returns genuine UTC ``datetime`` values.
 * Terminal payloads — ``camelCase`` on the wire (accepted via aliases). Two
   deliberate typing choices keep these robust:
 
@@ -19,12 +20,26 @@ Two families:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 
-from .enums import OrderOutcome, Platform, TradingStatus
+from .enums import (
+    ClosedTicketStatus,
+    CloseKind,
+    CloseLegStatus,
+    CloseSide,
+    KeyScope,
+    OrderLegStatus,
+    OrderOperation,
+    OrderOutcome,
+    Platform,
+    SymbolMatch,
+    TradingStatus,
+)
 
 
 class _Camel(BaseModel):
@@ -49,6 +64,12 @@ class Account(BaseModel):
     WebSocket APIs live. Both are empty until the account has a reachable
     terminal (shared pod or private droplet); a bridge-only account exposes
     none.
+
+    ``proxy_address`` / ``proxy_type`` / ``proxy_local_port`` describe the
+    outbound proxy the terminal is routed through (empty / ``None`` when
+    there is none; the proxy credentials are never returned).
+    ``trade_ea_symbol`` is the chart symbol hosting the trade expert —
+    empty means the terminal picked one automatically.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -62,6 +83,10 @@ class Account(BaseModel):
     error: str = ""
     rest_url: str = ""
     ws_url: str = ""
+    proxy_address: str = ""
+    proxy_type: str = ""
+    proxy_local_port: int | None = None
+    trade_ea_symbol: str = ""
     created_at: datetime
 
     @property
@@ -129,6 +154,497 @@ class PrivateServer(BaseModel):
     @property
     def free_slots(self) -> int:
         return max(self.purchased_slots - self.used_slots, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Management API (v1) — read-only keys (``/v1/readonly-keys``)
+# --------------------------------------------------------------------------- #
+
+
+class ScopedAccount(BaseModel):
+    """Compact account shape attached to a scoped read-only key."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    nickname: str = ""
+    platform: Platform
+    server: str = ""
+    login: int = 0
+
+
+class ReadOnlyKey(BaseModel):
+    """A named read-only API key (``fxs_ro_…``), as returned by the v1 API.
+
+    ``key`` is the plaintext secret — it is returned to its owner on every
+    read (there is no show-once step), so treat any object holding one as
+    sensitive. ``scope`` compares against :class:`fxsocket.KeyScope`:
+    ``"all"`` sees every account, ``"selected"`` only ``accounts``.
+    ``last_used_at`` is ``None`` until the key has authenticated once.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    name: str = ""
+    key: str
+    scope: str
+    accounts: list[ScopedAccount] = []
+    created_at: datetime
+    last_used_at: datetime | None = None
+
+    @property
+    def is_scoped(self) -> bool:
+        """True when the key only sees the accounts attached to it."""
+        return self.scope == KeyScope.SELECTED
+
+    @property
+    def account_ids(self) -> list[str]:
+        return [a.id for a in self.accounts]
+
+
+# --------------------------------------------------------------------------- #
+# Management API (v1) — multi-account trading (``/v1/orders``)
+# --------------------------------------------------------------------------- #
+
+
+def _id_of_account(value: Any) -> Any:
+    """Let ``account_id`` fields take an :class:`Account` /
+    :class:`PrivateServerAccount` as well as a bare id string."""
+    if isinstance(value, (Account, PrivateServerAccount)):
+        return value.id
+    return value
+
+
+class _OrderFields(BaseModel):
+    """Order parameters shared by :class:`OrderDefaults` and :class:`OrderLeg`.
+
+    Every field is optional here: a leg only needs what its batch
+    ``defaults`` don't already say. Unknown fields are rejected, mirroring
+    the API (an unknown field fails the whole batch with ``400``).
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    #: Exactly as the account's broker names it (``EURUSD``, ``EURUSD.sd``…).
+    symbol: str | None = None
+    #: ``Buy``, ``SellLimit``, … — case-insensitive, or an :class:`OrderOperation`.
+    operation: OrderOperation | str | None = None
+    #: Lots; must be > 0.
+    volume: float | None = None
+    #: Entry price — required for pending orders, ignored for market orders.
+    price: float | None = None
+    #: Points; the terminal defaults to 10 when omitted.
+    slippage: int | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    #: Required for ``*StopLimit`` operations.
+    stop_limit_price: float | None = None
+    #: Omit for good-till-cancelled.
+    expiration: str | datetime | date | None = None
+    comment: str | None = None
+    #: Magic number written onto the order (``expert_id`` on the wire).
+    magic: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("magic", "expert_id"),
+        serialization_alias="expert_id",
+    )
+
+
+class OrderDefaults(_OrderFields):
+    """Values every leg of a ``client.orders.send()`` batch inherits unless
+    the leg overrides them — "same trade, three accounts, three lot sizes"
+    stays short while nothing is locked down."""
+
+
+class OrderLeg(_OrderFields):
+    """One order aimed at one account, for ``client.orders.send()``.
+
+    Only ``account_id`` is mandatory (an :class:`Account` /
+    :class:`PrivateServerAccount` is accepted in its place); everything
+    else may come from the batch :class:`OrderDefaults`. A value set here
+    wins, *including a falsy one*: ``slippage=0`` really means zero, not
+    "fall back to the default".
+    """
+
+    account_id: str
+
+    @field_validator("account_id", mode="before")
+    @classmethod
+    def _coerce_account(cls, value: Any) -> Any:
+        return _id_of_account(value)
+
+
+class OrderLegResult(BaseModel):
+    """What happened to one leg of a ``client.orders.send()`` batch.
+
+    ``status`` is the honest answer (compare against
+    :class:`fxsocket.OrderLegStatus`) and only ``"filled"`` means the broker
+    took it. ``"timeout"`` is **unknown** — the order may well have reached
+    the broker; never blind-retry it (see :attr:`is_unknown`).
+
+    ``order`` / ``deal`` are the resulting tickets (0 if none), ``retcode``
+    the platform's own return code (0 when it never got that far) and
+    ``message`` the broker's order comment on a reply, otherwise why this
+    leg did not get one. ``volume`` is what the broker reported filling
+    where it reported one, otherwise the volume requested.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    account_id: str
+    platform: str
+    symbol: str
+    operation: str
+    volume: float
+    status: str
+    order: int = 0
+    deal: int = 0
+    price: float = 0.0
+    bid: float = 0.0
+    ask: float = 0.0
+    retcode: int = 0
+    retcode_description: str = ""
+    message: str = ""
+    latency_ms: int = 0
+
+    @property
+    def is_filled(self) -> bool:
+        """True when the broker accepted the order."""
+        return self.status == OrderLegStatus.FILLED
+
+    @property
+    def is_unknown(self) -> bool:
+        """True when the leg timed out — it may or may not have executed.
+        Replay with the same ``idempotency_key`` or reconcile against the
+        account's ``opened_orders()`` rather than re-sending."""
+        return self.status == OrderLegStatus.TIMEOUT
+
+
+class BatchOrderSummary(BaseModel):
+    """Counts for one ``client.orders.send()`` batch.
+
+    ``failed`` legs provably never reached the broker; ``unknown`` legs
+    timed out and may or may not have executed — they are kept apart so a
+    retry is a decision, not a reflex.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    requested: int
+    filled: int
+    failed: int
+    unknown: int
+
+
+class BatchOrderResult(BaseModel):
+    """Reply of ``client.orders.send()`` (``POST /v1/orders``).
+
+    ``results`` is *positional* — it mirrors the ``orders`` you sent one for
+    one, so ``zip(orders, result.results)``. Don't match on ``account_id``:
+    it repeats when several legs target the same account.
+
+    ``idempotent_replay`` is true when this is the stored reply of an
+    earlier batch with the same ``idempotency_key`` — nothing was sent.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    batch_id: str
+    idempotent_replay: bool = False
+    summary: BatchOrderSummary
+    results: list[OrderLegResult] = []
+
+    @property
+    def all_filled(self) -> bool:
+        """True when every leg was accepted by its broker."""
+        return self.summary.filled == self.summary.requested
+
+    @property
+    def filled_legs(self) -> list[OrderLegResult]:
+        return [r for r in self.results if r.is_filled]
+
+    @property
+    def failed_legs(self) -> list[OrderLegResult]:
+        """Legs that provably did not execute (not filled, not a timeout)."""
+        return [r for r in self.results if not r.is_filled and not r.is_unknown]
+
+    @property
+    def unknown_legs(self) -> list[OrderLegResult]:
+        """Legs that timed out — they may or may not have executed."""
+        return [r for r in self.results if r.is_unknown]
+
+
+class _CloseFields(BaseModel):
+    """Selector shared by :class:`CloseDefaults` and :class:`CloseLeg`."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    #: Symbol to close, as the broker names it. ``"*"`` closes every symbol
+    #: and must be typed literally — an omitted symbol is an error, never a
+    #: silent close-everything.
+    symbol: str | None = None
+    #: ``exact`` (default) or ``base`` — see :class:`fxsocket.SymbolMatch`.
+    symbol_match: SymbolMatch | str | None = None
+    #: ``long``, ``short`` or ``any`` (default).
+    side: CloseSide | str | None = None
+    #: ``position`` (default), ``pending`` or ``any``.
+    kind: CloseKind | str | None = None
+    #: Only touch orders carrying this magic number.
+    magic: int | None = None
+    #: Partial-close volume per matched position; omit for a full close.
+    volume: float | None = None
+    #: Points; the terminal defaults to 10 when omitted.
+    slippage: int | None = None
+
+
+class CloseDefaults(_CloseFields):
+    """Selector values every account of a ``client.orders.close()`` batch
+    inherits unless it overrides them."""
+
+
+class CloseLeg(_CloseFields):
+    """What to close on one account, for ``client.orders.close()``.
+
+    Either a selector (``symbol`` and friends — possibly inherited from the
+    batch :class:`CloseDefaults`) or an explicit ``tickets`` list, never
+    both. Tickets go stale the moment a stop fires, so prefer a selector
+    unless you read them from ``opened_orders()`` moments ago.
+    """
+
+    account_id: str
+    tickets: list[int] | None = None
+
+    @field_validator("account_id", mode="before")
+    @classmethod
+    def _coerce_account(cls, value: Any) -> Any:
+        return _id_of_account(value)
+
+
+class ClosedTicket(BaseModel):
+    """What happened to one ticket in a ``client.orders.close()`` batch.
+
+    ``status`` compares against :class:`fxsocket.ClosedTicketStatus`.
+    ``"skipped"`` means it was never sent (the per-account cap or the batch
+    deadline), so it definitely did not close; ``"timeout"`` means it was
+    sent and never answered, so it may well have. ``kind`` is
+    ``"position"`` or ``"pending"``; ``type`` is ``Buy``, ``SellLimit``, ….
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    ticket: int
+    symbol: str = ""
+    type: str = ""
+    kind: str = ""
+    volume: float = 0.0
+    status: str
+    retcode: int = 0
+    retcode_description: str = ""
+    price: float = 0.0
+    message: str = ""
+    latency_ms: int = 0
+
+    @property
+    def is_closed(self) -> bool:
+        return self.status == ClosedTicketStatus.CLOSED
+
+    @property
+    def is_unknown(self) -> bool:
+        """True when the close timed out — it may or may not have happened."""
+        return self.status == ClosedTicketStatus.TIMEOUT
+
+    @property
+    def is_pending(self) -> bool:
+        """True when this row is a pending order (vs. a position)."""
+        return self.kind.lower() == "pending"
+
+
+class CloseLegResult(BaseModel):
+    """What happened on one account of a ``client.orders.close()`` batch.
+
+    ``status`` compares against :class:`fxsocket.CloseLegStatus`:
+
+    - ``closed`` — every matched order closed.
+    - ``partial`` — some closed, some did not; read ``results``.
+    - ``failed`` — orders matched and none of them closed.
+    - ``nothing_matched`` — the selector found nothing. Not an error.
+    - ``unavailable`` / ``unreachable`` / ``invalid`` — the lookup itself
+      failed, so nothing is known about what is open there (``matched`` is
+      0 and says nothing).
+    - ``timeout`` — the lookup or the account's whole job ran out of time.
+      Orders may have closed.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    account_id: str
+    platform: str = ""
+    status: str
+    matched: int = 0
+    closed: int = 0
+    message: str = ""
+    latency_ms: int = 0
+    results: list[ClosedTicket] = []
+
+    @property
+    def is_closed(self) -> bool:
+        """True when every matched order closed."""
+        return self.status == CloseLegStatus.CLOSED
+
+    @property
+    def nothing_matched(self) -> bool:
+        return self.status == CloseLegStatus.NOTHING_MATCHED
+
+    @property
+    def is_unknown(self) -> bool:
+        """True when this account's job timed out — orders may have closed."""
+        return self.status == CloseLegStatus.TIMEOUT
+
+
+class BatchCloseSummary(BaseModel):
+    """Counts for one ``client.orders.close()`` batch.
+
+    ``failed`` tickets provably did not close; ``unknown`` tickets timed out
+    and may or may not have. ``accounts_unknown`` are accounts whose ticket
+    list was never established — their ``matched`` is 0 and says nothing
+    about what is actually open there.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    accounts: int
+    matched: int
+    closed: int
+    failed: int
+    unknown: int
+    accounts_unknown: int = 0
+
+
+class BatchCloseResult(BaseModel):
+    """Reply of ``client.orders.close()`` (``POST /v1/orders/close``).
+
+    ``results`` mirrors the ``accounts`` you sent one for one, in request
+    order. ``idempotent_replay`` is true when this is the stored reply of
+    an earlier batch with the same ``idempotency_key`` — nothing was sent.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    batch_id: str
+    idempotent_replay: bool = False
+    summary: BatchCloseSummary
+    results: list[CloseLegResult] = []
+
+    @property
+    def all_closed(self) -> bool:
+        """True when nothing failed, nothing timed out and every account's
+        open orders could be established — a selector that matched nothing
+        counts as done."""
+        s = self.summary
+        return s.failed == 0 and s.unknown == 0 and s.accounts_unknown == 0
+
+    @property
+    def unknown_accounts(self) -> list[CloseLegResult]:
+        """Accounts whose job timed out — orders there may have closed."""
+        return [r for r in self.results if r.is_unknown]
+
+
+# --------------------------------------------------------------------------- #
+# Management API (v1) — wallet (``/v1/wallet``, read-only)
+# --------------------------------------------------------------------------- #
+
+
+def _eur(cents: int) -> Decimal:
+    return Decimal(cents) / Decimal(100)
+
+
+class TopUp(BaseModel):
+    """A prepaid-balance top-up order.
+
+    ``status`` is ``pending``, ``partial``, ``paid`` or ``failed``.
+    ``credited_eur_cents`` is what has actually landed so far — lower than
+    ``amount_eur_cents`` while a payment is short. ``deposit_amount`` is the
+    provider's raw *unscaled* integer string; ``deposit_amount_decimal`` is
+    the human-readable amount. The quote lapses at ``expires_at``.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    status: str
+    amount_eur_cents: int
+    credited_eur_cents: int = 0
+    deposit_address: str = ""
+    deposit_amount: str = ""
+    deposit_amount_decimal: str = ""
+    asset_code: str = ""
+    blockchain_code: str = ""
+    expires_at: datetime | None = None
+
+    @property
+    def amount_eur(self) -> Decimal:
+        return _eur(self.amount_eur_cents)
+
+    @property
+    def credited_eur(self) -> Decimal:
+        return _eur(self.credited_eur_cents)
+
+
+class UpcomingCharge(BaseModel):
+    """One thing the prepaid balance is going to pay for, and when.
+
+    ``kind`` is ``"seat"`` (an account seat) or ``"server"`` (a
+    balance-funded private server); ``label`` names the account or server.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    when: datetime
+    amount_eur_cents: int
+    kind: str
+    label: str = ""
+
+    @property
+    def amount_eur(self) -> Decimal:
+        return _eur(self.amount_eur_cents)
+
+
+class Wallet(BaseModel):
+    """Your prepaid balance: what is in it, what has been asked for but has
+    not landed yet, and what it is going to pay for over the next 30 days
+    (``GET /v1/wallet``).
+
+    ``upcoming`` is a projection in date order covering account seats and
+    balance-funded private servers together, since they share the one
+    balance. Affordability is cumulative: with 24 EUR and three 12 EUR
+    renewals the first two are covered and the third is not, which is why
+    ``shortfall_eur_cents`` is the *total* gap (0 when covered), not the
+    size of any single charge. All amounts are integer EUR cents; the
+    ``*_eur`` properties give :class:`~decimal.Decimal` euros.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    balance_eur_cents: int
+    pending_topups: list[TopUp] = []
+    upcoming: list[UpcomingCharge] = []
+    upcoming_total_eur_cents: int = 0
+    shortfall_eur_cents: int = 0
+    covers_upcoming: bool = True
+
+    @property
+    def balance_eur(self) -> Decimal:
+        return _eur(self.balance_eur_cents)
+
+    @property
+    def upcoming_total_eur(self) -> Decimal:
+        return _eur(self.upcoming_total_eur_cents)
+
+    @property
+    def shortfall_eur(self) -> Decimal:
+        """How much to top up to cover everything in ``upcoming``."""
+        return _eur(self.shortfall_eur_cents)
 
 
 # --------------------------------------------------------------------------- #

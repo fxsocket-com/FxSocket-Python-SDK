@@ -1,9 +1,10 @@
 """Top-level entry points: :class:`Client` (sync) and :class:`AsyncClient`.
 
-Both expose ``.accounts`` (the management API), ``.terminal(account)`` (the
-per-account terminal REST client), and ``.stream(account)`` (WebSocket
-streaming — a sync :class:`~fxsocket.Stream` or an async
-:class:`~fxsocket.AsyncStream`).
+Both expose the management API — ``.accounts``, ``.private_servers``,
+``.readonly_keys``, ``.wallet`` and ``.orders`` (multi-account trading) —
+plus ``.terminal(account)`` (the per-account terminal REST client) and
+``.stream(account)`` (WebSocket streaming — a sync :class:`~fxsocket.Stream`
+or an async :class:`~fxsocket.AsyncStream`).
 """
 
 from __future__ import annotations
@@ -19,11 +20,16 @@ from .management import (
     Accounts,
     AsyncAccounts,
     AsyncPrivateServers,
+    AsyncReadOnlyKeys,
+    AsyncWalletResource,
     PrivateServers,
+    ReadOnlyKeys,
+    WalletResource,
 )
 from .models import Account, PrivateServerAccount
 from .terminal.client import AsyncTerminalClient, TerminalClient
 from .terminal.stream import AsyncStream, Stream
+from .trading import AsyncOrders, Orders
 
 
 def _resolve_api_key(api_key: str | None) -> str:
@@ -70,6 +76,13 @@ class Client:
         self.accounts = Accounts(SyncHTTP(self._http_client))
         #: Private hosting servers (the v1 API).
         self.private_servers = PrivateServers(SyncHTTP(self._http_client))
+        #: Multi-account trading — one order / close fanned out to several
+        #: accounts (the v1 API).
+        self.orders = Orders(SyncHTTP(self._http_client))
+        #: Named read-only API keys (the v1 API).
+        self.readonly_keys = ReadOnlyKeys(SyncHTTP(self._http_client))
+        #: Prepaid balance, read-only (the v1 API).
+        self.wallet = WalletResource(SyncHTTP(self._http_client))
         self._terminals: dict[tuple[str, str], TerminalClient] = {}
 
     def terminal(
@@ -186,6 +199,9 @@ class AsyncClient:
         )
         self.accounts = AsyncAccounts(AsyncHTTP(self._http_client))
         self.private_servers = AsyncPrivateServers(AsyncHTTP(self._http_client))
+        self.orders = AsyncOrders(AsyncHTTP(self._http_client))
+        self.readonly_keys = AsyncReadOnlyKeys(AsyncHTTP(self._http_client))
+        self.wallet = AsyncWalletResource(AsyncHTTP(self._http_client))
         self._terminals: dict[tuple[str, str], AsyncTerminalClient] = {}
 
     def terminal(
