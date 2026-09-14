@@ -416,7 +416,8 @@ with Client(api_key="fxs_live_...", verify_terminal_tls=False) as fx:
             server, server="ICMarkets-Demo", login=1150125, password="..."
         )
     except SlotsFullError as err:
-        print(f"Server full ({err.used}/{err.cap}) — raise the limit in the dashboard.")
+        print(f"Server full ({err.used}/{err.cap})")
+        server = fx.private_servers.resize(server, slots=err.cap + 1)
 
     # Poll until the on-server agent has the terminal up, then trade as usual.
     while True:
@@ -433,8 +434,68 @@ Accounts on a private server are traded and streamed exactly like
 shared-cluster accounts — their `rest_url` / `ws_url` simply point at the
 server's dedicated IP. The server presents a self-signed certificate, so reach
 it with `Client(..., verify_terminal_tls=False)` (or supply a pinned CA).
-*Purchasing* a server, canceling, and slot changes happen in the dashboard;
-the API deliberately exposes no billing operations.
+
+`server.cancel_at_period_end` is `True` once a server has been told to stop
+instead of renewing; it then runs until `server.period_end` and expires.
+
+### Buying, resizing and canceling
+
+`fx.private_servers.regions()` returns where servers may run, how big they may
+be and what that costs — call it before buying rather than hardcoding slugs:
+
+```python
+options = fx.private_servers.regions()
+if options.enabled:
+    print(options.region_codes)                     # ['fra1', 'lon1', ...]
+    print(options.max_slots, options.max_servers)
+    print(options.monthly_price_eur(3))             # Decimal('45') — 3 slots/month
+```
+
+`create()` buys one, charged to the prepaid balance immediately. It comes back
+`provisioning`; poll `get()` until it is `ready`, usually a couple of minutes:
+
+```python
+from fxsocket import InsufficientBalanceError, PrivateServerStatus, ServerLimitError
+
+try:
+    server = fx.private_servers.create(slots=2, region="fra1", name="prop-guard")
+except InsufficientBalanceError as err:
+    print(f"Top up {err.shortfall_eur} EUR first")
+except ServerLimitError:
+    print(f"Already own the maximum ({options.max_servers})")
+
+while server.status != PrivateServerStatus.READY:
+    time.sleep(10)
+    server = fx.private_servers.get(server)
+```
+
+`resize()` changes the slot count. Increases are prorated over the rest of the
+period and charged now (the renewal date doesn't move); decreases are free and
+apply at the next renewal, so paid-for capacity is never destroyed mid-month.
+Shrinking below the accounts already on the server raises
+`AccountsExceedTargetError` — remove accounts first:
+
+```python
+server = fx.private_servers.resize(server, slots=4)
+```
+
+`cancel()` stops the server renewing: it runs until `period_end`, then expires.
+`resume()` undoes that while the period lasts (afterwards the machine is gone
+and `AlreadyLapsedError` is raised). `delete()` destroys the machine and every
+account on it right away, with **no refund** for the rest of the prepaid month —
+prefer `cancel()` unless you really want it gone now:
+
+```python
+server = fx.private_servers.cancel(server)      # stop at period_end
+assert server.cancel_at_period_end
+server = fx.private_servers.resume(server)      # changed your mind
+fx.private_servers.delete(server)               # irreversible, no refund
+```
+
+All of these move the prepaid balance, so they only work on balance-funded
+servers — a card- or crypto-funded one raises `NotBalanceFundedError` (a
+`ForbiddenError` subclass) and is managed from the dashboard. Read-only
+`fxs_ro_…` keys get a plain `ForbiddenError`.
 
 ## Wallet
 
@@ -456,7 +517,8 @@ if not wallet.covers_upcoming:
 Affordability is cumulative — with 24 EUR and three 12 EUR renewals the
 first two are covered and the third is not — so `shortfall_eur` is the
 total gap, not the size of any single charge. Topping up happens in the
-dashboard; the SDK deliberately exposes no payment operations.
+dashboard; the balance is only ever *spent* through the SDK (account seats
+and `private_servers.create()` / `resize()`), never topped up.
 
 ## Timestamps
 

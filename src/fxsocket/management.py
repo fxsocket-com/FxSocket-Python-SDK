@@ -18,6 +18,7 @@ from .models import (
     Account,
     PrivateServer,
     PrivateServerAccount,
+    PrivateServerOptions,
     ReadOnlyKey,
     Wallet,
 )
@@ -249,11 +250,22 @@ def _private_account_payload(
     }
 
 
+def _private_server_payload(*, slots: int, region: str, name: str) -> dict[str, object]:
+    body: dict[str, object] = {"slots": slots, "region": region}
+    if name:
+        body["name"] = name
+    return body
+
+
 class PrivateServers:
     """Synchronous private-server operations.
 
-    Read + on-server account management only: purchasing a server,
-    canceling, and slot changes happen in the dashboard.
+    Covers the whole lifecycle: :meth:`regions` to see what can be bought,
+    :meth:`create` to buy one from the prepaid balance, :meth:`resize`,
+    :meth:`cancel` / :meth:`resume`, :meth:`delete`, and
+    :meth:`add_account` / :meth:`remove_account` for the accounts on it.
+    Balance is the only payment method here — card and crypto purchases
+    need a checkout redirect, so those stay in the dashboard.
     """
 
     def __init__(self, http: SyncHTTP) -> None:
@@ -264,10 +276,102 @@ class PrivateServers:
         data = self._http.request("GET", "/private-servers")
         return [PrivateServer.model_validate(row) for row in data]
 
+    def regions(self) -> PrivateServerOptions:
+        """Where private servers may run, how big they may be, what it costs.
+
+        Returns the whole options payload, not just the region list — see
+        :class:`~fxsocket.PrivateServerOptions`.
+        """
+        data = self._http.request("GET", "/private-servers/regions")
+        return PrivateServerOptions.model_validate(data)
+
     def get(self, server: PrivateServer | str) -> PrivateServer:
         """Fetch one server by id (use this to poll account readiness)."""
         data = self._http.request(
             "GET", f"/private-servers/{private_server_id_of(server)}"
+        )
+        return PrivateServer.model_validate(data)
+
+    def create(self, *, slots: int, region: str, name: str = "") -> PrivateServer:
+        """Buy a dedicated server, charged to the prepaid balance now.
+
+        ``region`` must be one of the ``code`` values from :meth:`regions`,
+        ``slots`` how many accounts it should hold (priced
+        ``first_slot + additional_slot * (slots - 1)`` per month, billed
+        again every month until you :meth:`cancel` it) and ``name`` an
+        optional label for your own reference.
+
+        Comes back already ``provisioning`` — poll :meth:`get` until
+        ``status`` is ``ready``, usually a couple of minutes. Raises
+        :class:`~fxsocket.InsufficientBalanceError` when the balance does
+        not cover it, :class:`~fxsocket.ServerLimitError` when you already
+        own the maximum, and :class:`~fxsocket.ForbiddenError` when private
+        hosting is off for the deployment or the key is read-only.
+        """
+        data = self._http.request(
+            "POST",
+            "/private-servers",
+            json=_private_server_payload(slots=slots, region=region, name=name),
+        )
+        return PrivateServer.model_validate(data)
+
+    def resize(self, server: PrivateServer | str, *, slots: int) -> PrivateServer:
+        """Change how many accounts the server may hold.
+
+        Increases are prorated over what is left of the current period and
+        charged to the balance immediately; the renewal date does not move.
+        Decreases are free and take effect at the next renewal, so capacity
+        already paid for is never destroyed mid-period.
+
+        Raises :class:`~fxsocket.AccountsExceedTargetError` when more
+        accounts are on the server than the new limit allows (remove some
+        first), :class:`~fxsocket.InsufficientBalanceError` when the
+        balance does not cover a prorated increase, and
+        :class:`~fxsocket.NotBalanceFundedError` for card- or
+        crypto-funded servers.
+        """
+        data = self._http.request(
+            "PATCH",
+            f"/private-servers/{private_server_id_of(server)}",
+            json={"slots": slots},
+        )
+        return PrivateServer.model_validate(data)
+
+    def delete(self, server: PrivateServer | str) -> None:
+        """Destroy the machine and everything on it — irreversible.
+
+        The droplet is torn down, its IP released and every account hosted
+        on it removed. There is **no refund**: whatever is left of the
+        prepaid month is forfeited. To stop paying without losing the rest
+        of the period, use :meth:`cancel` instead.
+        """
+        self._http.request("DELETE", f"/private-servers/{private_server_id_of(server)}")
+
+    def cancel(self, server: PrivateServer | str) -> PrivateServer:
+        """Stop the server renewing, letting the paid period run out.
+
+        It keeps running until ``period_end``, then expires; nothing is
+        refunded and nothing is charged again. Prefer this to
+        :meth:`delete`, which forfeits the rest of the month. Reversible
+        with :meth:`resume` while the period lasts. Raises
+        :class:`~fxsocket.NotBalanceFundedError` for card- or
+        crypto-funded servers.
+        """
+        data = self._http.request(
+            "POST", f"/private-servers/{private_server_id_of(server)}/cancel"
+        )
+        return PrivateServer.model_validate(data)
+
+    def resume(self, server: PrivateServer | str) -> PrivateServer:
+        """Undo a :meth:`cancel`, so the server renews from the balance
+        again at the end of the current period.
+
+        Only works while it is still running: raises
+        :class:`~fxsocket.AlreadyLapsedError` once the paid period has
+        lapsed and the machine is gone — buy a new one with :meth:`create`.
+        """
+        data = self._http.request(
+            "DELETE", f"/private-servers/{private_server_id_of(server)}/cancel"
         )
         return PrivateServer.model_validate(data)
 
@@ -325,9 +429,46 @@ class AsyncPrivateServers:
         data = await self._http.request("GET", "/private-servers")
         return [PrivateServer.model_validate(row) for row in data]
 
+    async def regions(self) -> PrivateServerOptions:
+        data = await self._http.request("GET", "/private-servers/regions")
+        return PrivateServerOptions.model_validate(data)
+
     async def get(self, server: PrivateServer | str) -> PrivateServer:
         data = await self._http.request(
             "GET", f"/private-servers/{private_server_id_of(server)}"
+        )
+        return PrivateServer.model_validate(data)
+
+    async def create(self, *, slots: int, region: str, name: str = "") -> PrivateServer:
+        data = await self._http.request(
+            "POST",
+            "/private-servers",
+            json=_private_server_payload(slots=slots, region=region, name=name),
+        )
+        return PrivateServer.model_validate(data)
+
+    async def resize(self, server: PrivateServer | str, *, slots: int) -> PrivateServer:
+        data = await self._http.request(
+            "PATCH",
+            f"/private-servers/{private_server_id_of(server)}",
+            json={"slots": slots},
+        )
+        return PrivateServer.model_validate(data)
+
+    async def delete(self, server: PrivateServer | str) -> None:
+        await self._http.request(
+            "DELETE", f"/private-servers/{private_server_id_of(server)}"
+        )
+
+    async def cancel(self, server: PrivateServer | str) -> PrivateServer:
+        data = await self._http.request(
+            "POST", f"/private-servers/{private_server_id_of(server)}/cancel"
+        )
+        return PrivateServer.model_validate(data)
+
+    async def resume(self, server: PrivateServer | str) -> PrivateServer:
+        data = await self._http.request(
+            "DELETE", f"/private-servers/{private_server_id_of(server)}/cancel"
         )
         return PrivateServer.model_validate(data)
 

@@ -38,7 +38,15 @@ class AuthError(FxSocketError):
 class ForbiddenError(FxSocketError):
     """The key is valid but may not do this (HTTP 403) — typically a
     read-only ``fxs_ro_…`` key on an endpoint that mutates state, such as
-    multi-account trading."""
+    multi-account trading.
+
+    Base class for :class:`NotBalanceFundedError`."""
+
+
+class NotBalanceFundedError(ForbiddenError):
+    """This private server is not paid from the prepaid balance (HTTP 403
+    ``not_balance_funded``). Card- and crypto-funded servers are resized
+    and canceled in the dashboard, since the API only moves balance."""
 
 
 class RateLimitError(FxSocketError):
@@ -128,7 +136,7 @@ class DuplicateAccountError(FxSocketError):
 
 class SlotsFullError(FxSocketError):
     """Every purchased slot on the private server is taken (HTTP 409
-    ``slots_full``). Raise the server's limit from the dashboard."""
+    ``slots_full``). Buy more with ``client.private_servers.resize()``."""
 
     def __init__(
         self,
@@ -141,6 +149,24 @@ class SlotsFullError(FxSocketError):
         super().__init__(message, **kw)
         self.used = used
         self.cap = cap
+
+
+class ServerLimitError(FxSocketError):
+    """You already own as many private servers as you may (HTTP 409
+    ``server_limit_reached``) — see ``max_servers`` on
+    :class:`~fxsocket.PrivateServerOptions`."""
+
+
+class AccountsExceedTargetError(FxSocketError):
+    """The server holds more accounts than the requested slot count allows
+    (HTTP 409 ``accounts_exceed_target``). Remove accounts first, then
+    resize."""
+
+
+class AlreadyLapsedError(FxSocketError):
+    """The paid period has already run out, so the cancellation can no
+    longer be undone (HTTP 409 ``already_lapsed``) — the machine is gone;
+    buy a new server."""
 
 
 class IdempotencyError(FxSocketError):
@@ -228,6 +254,8 @@ def error_from_response(resp: httpx.Response) -> FxSocketError:
     if status == 401:
         return AuthError(message, **common)
     if status == 403:
+        if code == "not_balance_funded":
+            return NotBalanceFundedError(message, **common)
         return ForbiddenError(message, **common)
     if code in _IDEMPOTENCY_CODES:
         return IdempotencyError(message, **common)
@@ -247,6 +275,12 @@ def error_from_response(resp: httpx.Response) -> FxSocketError:
             return SlotsFullError(
                 message, used=body.get("used"), cap=body.get("cap"), **common
             )
+        if code == "server_limit_reached":
+            return ServerLimitError(message, **common)
+        if code == "accounts_exceed_target":
+            return AccountsExceedTargetError(message, **common)
+        if code == "already_lapsed":
+            return AlreadyLapsedError(message, **common)
         return DuplicateAccountError(message, **common)
     if status == 402:
         fields: dict[str, Any] = body if isinstance(body, dict) else {}

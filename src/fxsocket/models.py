@@ -131,8 +131,8 @@ class PrivateServer(BaseModel):
     ``status`` is the server lifecycle — compare against
     :class:`fxsocket.PrivateServerStatus`. ``purchased_slots`` is the paid
     limit; ``used_slots`` how many accounts currently live on the server.
-    Purchasing, canceling and slot changes happen in the dashboard, not
-    the API.
+    ``cancel_at_period_end`` is true once the server has been told to stop
+    instead of renewing — it then runs until ``period_end`` and expires.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -144,6 +144,7 @@ class PrivateServer(BaseModel):
     ip: str = ""
     purchased_slots: int = 0
     used_slots: int = 0
+    cancel_at_period_end: bool = False
     period_end: datetime | None = None
     accounts: list[PrivateServerAccount] = []
 
@@ -154,6 +155,52 @@ class PrivateServer(BaseModel):
     @property
     def free_slots(self) -> int:
         return max(self.purchased_slots - self.used_slots, 0)
+
+
+class Region(BaseModel):
+    """One place a private server can run in."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    code: str
+    label: str = ""
+
+
+class PrivateServerOptions(BaseModel):
+    """Where private servers may run, how big they may be and what that
+    costs (``GET /v1/private-servers/regions``).
+
+    ``enabled`` is false when private hosting is off for the deployment —
+    ``regions`` is then empty. Prices are integer EUR cents, and a server
+    costs ``first_slot_eur_cents + additional_slot_eur_cents * (slots -
+    1)`` per month; :meth:`monthly_price_eur_cents` does that arithmetic.
+    Treat the returned list as authoritative rather than hardcoding region
+    slugs.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = True
+    regions: list[Region] = []
+    max_slots: int = 0
+    max_servers: int = 0
+    first_slot_eur_cents: int = 0
+    additional_slot_eur_cents: int = 0
+
+    @property
+    def region_codes(self) -> list[str]:
+        """Just the slugs, in the order the API returned them."""
+        return [region.code for region in self.regions]
+
+    def monthly_price_eur_cents(self, slots: int) -> int:
+        """What a server of ``slots`` accounts costs per month, in cents."""
+        if slots < 1:
+            raise ValueError("slots must be at least 1")
+        return self.first_slot_eur_cents + self.additional_slot_eur_cents * (slots - 1)
+
+    def monthly_price_eur(self, slots: int) -> Decimal:
+        """:meth:`monthly_price_eur_cents` as euros."""
+        return _eur(self.monthly_price_eur_cents(slots))
 
 
 # --------------------------------------------------------------------------- #
