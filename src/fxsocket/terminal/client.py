@@ -4,11 +4,10 @@ One :class:`TerminalClient` (sync) / :class:`AsyncTerminalClient` (async) is
 bound to a single account's terminal endpoint (``Account.rest_url``). The two
 are method-for-method mirrors; only the awaiting differs.
 
-Platform awareness is enforced **client-side** before the request goes out:
-MT5-only timeframes (``M2``/``M3``/``H2``/``H6``/``H8``/``H12``) don't exist on
-MT4, so the SDK raises :class:`~fxsocket.UnsupportedOnPlatformError` rather than
-letting the terminal answer 400. (Order *operations*, including stop-limit, are
-accepted by both platforms' terminal APIs, so they are not gated.)
+MT4 and MT5 share one interface with nothing gated by platform: both terminal
+APIs accept the same nine timeframes (see :class:`~fxsocket.Timeframe`) and
+all eight order operations, stop-limit included. A timeframe outside that set
+raises :class:`~fxsocket.ValidationError` before the request goes out.
 
 Order inputs are validated client-side to fail fast and, above all, safely:
 the same constraints the terminal enforces (volume > 0, an entry price for
@@ -30,7 +29,6 @@ import httpx
 
 from .._http import AsyncHTTP, SyncHTTP, auth_headers
 from ..enums import (
-    MT5_ONLY_TIMEFRAMES,
     PENDING_OPERATIONS,
     STOP_LIMIT_OPERATIONS,
     OrderOperation,
@@ -38,7 +36,6 @@ from ..enums import (
     Timeframe,
 )
 from ..errors import (
-    UnsupportedOnPlatformError,
     ValidationError,
     error_from_response,
 )
@@ -68,17 +65,11 @@ _OP_BY_NORM = {op.value.lower(): op for op in OrderOperation}
 
 _TF_HUMAN = {
     "1min": Timeframe.M1,
-    "2min": Timeframe.M2,
-    "3min": Timeframe.M3,
     "5min": Timeframe.M5,
     "15min": Timeframe.M15,
     "30min": Timeframe.M30,
     "1h": Timeframe.H1,
-    "2h": Timeframe.H2,
     "4h": Timeframe.H4,
-    "6h": Timeframe.H6,
-    "8h": Timeframe.H8,
-    "12h": Timeframe.H12,
     "1d": Timeframe.D1,
     "1w": Timeframe.W1,
     "1month": Timeframe.MN1,
@@ -108,7 +99,10 @@ def coerce_timeframe(value: Timeframe | str) -> Timeframe:
         pass
     tf = _TF_HUMAN.get(raw.lower())
     if tf is None:
-        raise ValidationError(f"Unknown timeframe: {value!r}")
+        supported = ", ".join(t.value for t in Timeframe)
+        raise ValidationError(
+            f"Unknown timeframe: {value!r}; the terminal API accepts {supported}"
+        )
     return tf
 
 
@@ -182,13 +176,6 @@ def _resolve_modify_sl_tp(
     sl = 0.0 if clear_stop_loss else stop_loss
     tp = 0.0 if clear_take_profit else take_profit
     return sl, tp
-
-
-def _check_timeframe(tf: Timeframe, platform: Platform) -> None:
-    if platform is Platform.MT4 and tf in MT5_ONLY_TIMEFRAMES:
-        raise UnsupportedOnPlatformError(
-            f"{tf.value} is an MT5-only timeframe; not available on MT4."
-        )
 
 
 def _fmt_time(value: str | datetime | date | None) -> str | None:
@@ -357,7 +344,6 @@ class TerminalClient:
         to: str | datetime | date | None = None,
     ) -> list[Candle]:
         tf = coerce_timeframe(timeframe)
-        _check_timeframe(tf, self.platform)
         params = _clean(
             {
                 "symbol": symbol,
@@ -638,7 +624,6 @@ class AsyncTerminalClient:
         to: str | datetime | date | None = None,
     ) -> list[Candle]:
         tf = coerce_timeframe(timeframe)
-        _check_timeframe(tf, self.platform)
         params = _clean(
             {
                 "symbol": symbol,

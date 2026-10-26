@@ -38,8 +38,8 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from websockets.asyncio.client import connect as _ws_connect
 from websockets.exceptions import ConnectionClosed
 
-from ..enums import MT5_ONLY_TIMEFRAMES, Platform, Timeframe
-from ..errors import StreamError, UnsupportedOnPlatformError, ValidationError
+from ..enums import Platform, Timeframe
+from ..errors import StreamError, ValidationError
 from ..models import (
     AccountSummary,
     Candle,
@@ -224,7 +224,6 @@ def _validate_sub(
     topic: str,
     symbol: str | None,
     timeframe: Timeframe | str | None,
-    platform: Platform,
 ) -> str | None:
     """Validate a subscription; returns the canonical timeframe label (or None)."""
     if topic not in _TOPICS:
@@ -236,12 +235,7 @@ def _validate_sub(
     if topic == "bars":
         if not timeframe:
             raise ValidationError("topic 'bars' requires a timeframe")
-        tf = coerce_timeframe(timeframe)
-        if platform is Platform.MT4 and tf in MT5_ONLY_TIMEFRAMES:
-            raise UnsupportedOnPlatformError(
-                f"{tf.value} is an MT5-only timeframe; not available on MT4."
-            )
-        return tf.value
+        return coerce_timeframe(timeframe).value
     return None
 
 
@@ -319,7 +313,7 @@ class AsyncStream:
         symbol: str | None = None,
         timeframe: Timeframe | str | None = None,
     ) -> None:
-        tf = _validate_sub(topic, symbol, timeframe, self.platform)
+        tf = _validate_sub(topic, symbol, timeframe)
         self._subs.add((topic, symbol, tf))
         await self._send(_sub_payload(topic, symbol, tf))
 
@@ -330,7 +324,7 @@ class AsyncStream:
         symbol: str | None = None,
         timeframe: Timeframe | str | None = None,
     ) -> None:
-        tf = _validate_sub(topic, symbol, timeframe, self.platform)
+        tf = _validate_sub(topic, symbol, timeframe)
         self._subs.discard((topic, symbol, tf))
         payload = _sub_payload(topic, symbol, tf)
         payload["action"] = "unsubscribe"

@@ -229,35 +229,23 @@ class HealthStatus(str, Enum):
 class Timeframe(str, Enum):
     """Candle timeframes.
 
-    The MT5-only members (``M2``, ``M3``, ``H2``, ``H6``, ``H8``, ``H12``)
-    are rejected client-side for MT4 accounts.
+    Exactly the nine the terminal API accepts, on MT4 and MT5 alike (REST
+    ``price_history`` and the ``bars`` stream). MT5's other native periods
+    (``M2``, ``H2``, ``H12`` …) are not exposed by the terminal API, so they
+    are not members.
     """
 
     M1 = "M1"
-    M2 = "M2"
-    M3 = "M3"
     M5 = "M5"
     M15 = "M15"
     M30 = "M30"
     H1 = "H1"
-    H2 = "H2"
     H4 = "H4"
-    H6 = "H6"
-    H8 = "H8"
-    H12 = "H12"
     D1 = "D1"
     W1 = "W1"
     MN1 = "MN1"
 
 
-#: Timeframes that only MT5 supports.
-MT5_ONLY_TIMEFRAMES = frozenset(
-    {
-        Timeframe.M2,
-        Timeframe.M3,
-        Timeframe.H2,
-        Timeframe.H6,
-        Timeframe.H8,
-        Timeframe.H12,
-    }
-)
+#: Deprecated, always empty: both platforms accept every :class:`Timeframe`.
+#: Kept so existing imports don't break; will be removed in 1.0.
+MT5_ONLY_TIMEFRAMES: frozenset[Timeframe] = frozenset()

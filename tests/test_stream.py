@@ -21,7 +21,6 @@ from fxsocket import (
     TerminalUpdate,
     Tick,
     TradeUpdate,
-    UnsupportedOnPlatformError,
 )
 from fxsocket.terminal.stream import (
     StreamErrorEvent,
@@ -268,9 +267,12 @@ async def test_bars_requires_timeframe() -> None:
         await s.subscribe("bars", symbol="EURUSD")
 
 
-async def test_bars_mt5_only_timeframe_rejected_on_mt4() -> None:
-    s = AsyncStream(ws_url="ws://x/ws", api_key="k", platform="mt4")
-    with pytest.raises(UnsupportedOnPlatformError):
+@pytest.mark.parametrize("platform", ["mt4", "mt5"])
+async def test_bars_unsupported_timeframe_rejected(platform: str) -> None:
+    from fxsocket import ValidationError
+
+    s = AsyncStream(ws_url="ws://x/ws", api_key="k", platform=platform)
+    with pytest.raises(ValidationError):
         await s.subscribe_bars("EURUSD", "H6")
 
 

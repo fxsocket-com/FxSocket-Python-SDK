@@ -16,7 +16,6 @@ from fxsocket import (
     TerminalNotReadyError,
     TerminalTimeoutError,
     Timeframe,
-    UnsupportedOnPlatformError,
 )
 from fxsocket.models import Account
 from fxsocket.terminal.client import (
@@ -100,6 +99,21 @@ def test_coerce_operation_unknown() -> None:
 )
 def test_coerce_timeframe(value: object, expected: Timeframe) -> None:
     assert coerce_timeframe(value) is expected  # type: ignore[arg-type]
+
+
+def test_timeframe_matches_terminal_api() -> None:
+    # The nine labels the MT4 and MT5 terminal APIs parse (REST + `bars`).
+    assert [tf.value for tf in Timeframe] == [
+        "M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"
+    ]
+
+
+@pytest.mark.parametrize("value", ["H6", "M2", "h12", "2h", "3min", "7s"])
+def test_coerce_timeframe_unsupported(value: str) -> None:
+    from fxsocket import ValidationError
+
+    with pytest.raises(ValidationError, match="M1, M5, M15"):
+        coerce_timeframe(value)
 
 
 # --------------------------------------------------------------------------- #
@@ -249,9 +263,17 @@ def test_price_history_sends_canonical_timeframe() -> None:
     assert "to" not in req.url.params  # None omitted
 
 
-def test_price_history_rejects_mt5_timeframe_on_mt4() -> None:
-    with _term(platform="mt4") as t, pytest.raises(UnsupportedOnPlatformError):
+@respx.mock
+@pytest.mark.parametrize("platform", ["mt4", "mt5"])
+def test_price_history_rejects_unsupported_timeframe(platform: str) -> None:
+    from fxsocket import ValidationError
+
+    route = respx.get(f"{TERM}/PriceHistory").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    with _term(platform=platform) as t, pytest.raises(ValidationError):
         t.price_history("EURUSD", "H6")
+    assert not route.called
 
 
 # --------------------------------------------------------------------------- #
