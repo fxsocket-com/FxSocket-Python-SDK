@@ -4,10 +4,12 @@ One :class:`TerminalClient` (sync) / :class:`AsyncTerminalClient` (async) is
 bound to a single account's terminal endpoint (``Account.rest_url``). The two
 are method-for-method mirrors; only the awaiting differs.
 
-MT4 and MT5 share one interface with nothing gated by platform: both terminal
-APIs accept the same nine timeframes (see :class:`~fxsocket.Timeframe`) and
-all eight order operations, stop-limit included. A timeframe outside that set
-raises :class:`~fxsocket.ValidationError` before the request goes out.
+MT4 and MT5 share one interface. Both terminal APIs accept the same nine
+timeframes (see :class:`~fxsocket.Timeframe`); a timeframe outside that set
+raises :class:`~fxsocket.ValidationError` before the request goes out. The one
+platform gate is stop-limit: MT4 has no stop-limit order type, so a
+``*StopLimit`` operation on ``order_send`` or a ``stop_limit_price`` on
+``order_modify`` raises :class:`~fxsocket.UnsupportedOnPlatformError` on MT4.
 
 Order inputs are validated client-side to fail fast and, above all, safely:
 the same constraints the terminal enforces (volume > 0, an entry price for
@@ -17,12 +19,16 @@ silent ``order_modify`` footgun where a literal ``0.0`` stop-loss / take-profit
 do that explicitly, ``None`` (the default) keeps the current value.
 
 No request is auto-retried — in particular order send/modify/close must never
-replay, to avoid duplicate fills.
+replay, to avoid duplicate fills. To retry an ``order_send`` safely yourself
+(after a :class:`~fxsocket.TradeOutcomeUnknownError`, say), give it a
+``client_order_id``: the terminal trades an id once and answers every repeat
+with the first outcome.
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from collections.abc import Sequence
+from datetime import date, datetime, timezone
 from typing import Any
 
 import httpx
@@ -36,6 +42,7 @@ from ..enums import (
     Timeframe,
 )
 from ..errors import (
+    UnsupportedOnPlatformError,
     ValidationError,
     error_from_response,
 )
@@ -50,11 +57,15 @@ from ..models import (
     MarginCalc,
     OpenedOrder,
     OrderResult,
+    PendingOrder,
     PositionTrade,
     ProfitCalc,
     Quote,
     ServerTimezone,
+    ServerTiming,
     SymbolInfo,
+    SymbolInfoBatch,
+    SymbolSelectResult,
 )
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +197,85 @@ def _fmt_time(value: str | datetime | date | None) -> str | None:
     return str(value)
 
 
+def _fmt_utc(value: str | datetime | date | None) -> str | None:
+    """Format ``expiration_utc`` as ``YYYY-MM-DDTHH:MM:SSZ``.
+
+    An aware datetime is converted to UTC, a naive one is taken to be UTC
+    already, a date means midnight UTC; a string is sent unchanged.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        dt = value.astimezone(timezone.utc)
+    else:
+        dt = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _check_expiration(expiration: object, expiration_utc: object) -> None:
+    if expiration is not None and expiration_utc is not None:
+        raise ValidationError(
+            "pass either expiration (broker server time) or expiration_utc, not both"
+        )
+
+
+def _check_client_order_id(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str) or not 1 <= len(value) <= 64:
+        raise ValidationError("client_order_id must be a string of 1-64 characters")
+
+
+_MAX_SYMBOLS = 100
+
+
+def _check_symbols(symbols: Sequence[str]) -> list[str]:
+    """Validate a symbol list for ``symbol_select`` / ``symbol_infos``."""
+    if isinstance(symbols, str) or not isinstance(symbols, Sequence):
+        raise ValidationError("symbols must be a list of symbol names")
+    names = list(symbols)
+    if not names:
+        raise ValidationError("symbols must not be empty")
+    if len(names) > _MAX_SYMBOLS:
+        raise ValidationError(
+            f"at most {_MAX_SYMBOLS} symbols per call, got {len(names)}"
+        )
+    for name in names:
+        if not isinstance(name, str) or not name.strip() or "," in name:
+            raise ValidationError(f"invalid symbol name: {name!r}")
+    return names
+
+
+def _guard_stop_limit_send(platform: Platform, op: OrderOperation) -> None:
+    if platform is Platform.MT4 and op in STOP_LIMIT_OPERATIONS:
+        raise UnsupportedOnPlatformError(
+            f"{op.value} orders are not supported on MT4 (MT4 has no "
+            "stop-limit order type)"
+        )
+
+
+def _guard_stop_limit_modify(
+    platform: Platform, stop_limit_price: float | None
+) -> None:
+    if platform is Platform.MT4 and stop_limit_price is not None:
+        raise UnsupportedOnPlatformError(
+            "stop_limit_price is not supported on MT4 (MT4 has no stop-limit "
+            "order type)"
+        )
+
+
+def _order_result(body: Any, headers: Any) -> OrderResult:
+    """Build an :class:`OrderResult` from a trade reply and its headers."""
+    result = OrderResult.model_validate(body)
+    replayed = headers.get("Idempotent-Replayed", "").strip().lower() == "true"
+    timing = ServerTiming.from_header(headers.get("Server-Timing"))
+    return result.model_copy(
+        update={"idempotent_replayed": replayed, "server_timing": timing}
+    )
+
+
 def _clean(params: dict[str, Any]) -> dict[str, Any]:
     """Drop keys whose value is None (so omitted fields aren't sent)."""
     return {k: v for k, v in params.items() if v is not None}
@@ -202,8 +292,10 @@ def _order_send_body(
     take_profit: float | None,
     stop_limit_price: float | None,
     expiration: str | datetime | date | None,
+    expiration_utc: str | datetime | date | None,
     comment: str | None,
     magic: int | None,
+    client_order_id: str | None,
 ) -> dict[str, Any]:
     return _clean(
         {
@@ -216,8 +308,10 @@ def _order_send_body(
             "takeProfit": take_profit,
             "stopLimitPrice": stop_limit_price,
             "expiration": _fmt_time(expiration),
+            "expirationUtc": _fmt_utc(expiration_utc),
             "comment": comment,
             "expertId": magic,
+            "clientOrderId": client_order_id,
         }
     )
 
@@ -244,6 +338,7 @@ def _order_modify_body(
     price: float | None,
     stop_limit_price: float | None,
     expiration: str | datetime | date | None,
+    expiration_utc: str | datetime | date | None,
 ) -> dict[str, Any]:
     return _clean(
         {
@@ -253,6 +348,7 @@ def _order_modify_body(
             "price": price,
             "stopLimitPrice": stop_limit_price,
             "expiration": _fmt_time(expiration),
+            "expirationUtc": _fmt_utc(expiration_utc),
         }
     )
 
@@ -298,6 +394,13 @@ class TerminalClient:
         rows = self._http.request("GET", "/OpenedOrders")
         return [OpenedOrder.model_validate(r) for r in rows]
 
+    def pending_orders(self) -> list[PendingOrder]:
+        """The active pending orders (``GET /PendingOrders``), with initial
+        volume, stop-limit price and expiry (bridges MT5 0.17.0 / MT4 0.15.0
+        on)."""
+        rows = self._http.request("GET", "/PendingOrders")
+        return [PendingOrder.model_validate(r) for r in rows]
+
     def order_history(
         self,
         from_: str | datetime | date | None = None,
@@ -335,6 +438,29 @@ class TerminalClient:
         return SymbolInfo.model_validate(
             self._http.request("GET", "/SymbolInfo", params={"symbol": symbol})
         )
+
+    def symbol_infos(self, symbols: Sequence[str]) -> SymbolInfoBatch:
+        """Contract specs for up to 100 symbols in one call
+        (``GET /SymbolInfo?symbols=…``). Symbols that fail are listed in
+        ``errors`` instead of raising."""
+        names = _check_symbols(symbols)
+        return SymbolInfoBatch.model_validate(
+            self._http.request(
+                "GET", "/SymbolInfo", params={"symbols": ",".join(names)}
+            )
+        )
+
+    def symbol_select(self, symbols: Sequence[str]) -> list[SymbolSelectResult]:
+        """Put up to 100 symbols into Market Watch in one pass
+        (``POST /SymbolSelect``) and wait up to 1 s, once, until they quote.
+
+        Warm the symbols you will trade before the first order, so it does
+        not wait for a first tick. Needs a trading key (read-only keys get
+        403).
+        """
+        names = _check_symbols(symbols)
+        rows = self._http.request("POST", "/SymbolSelect", json={"symbols": names})
+        return [SymbolSelectResult.model_validate(r) for r in rows]
 
     def price_history(
         self,
@@ -409,8 +535,11 @@ class TerminalClient:
         expiration: str | datetime | date | None = None,
         comment: str | None = None,
         magic: int | None = None,
+        expiration_utc: str | datetime | date | None = None,
+        client_order_id: str | None = None,
     ) -> OrderResult:
         op = coerce_operation(operation)
+        _guard_stop_limit_send(self.platform, op)
         _validate_order_send(
             op,
             volume=volume,
@@ -419,6 +548,8 @@ class TerminalClient:
             stop_loss=stop_loss,
             take_profit=take_profit,
         )
+        _check_expiration(expiration, expiration_utc)
+        _check_client_order_id(client_order_id)
         body = _order_send_body(
             symbol=symbol,
             operation=op,
@@ -429,11 +560,13 @@ class TerminalClient:
             take_profit=take_profit,
             stop_limit_price=stop_limit_price,
             expiration=expiration,
+            expiration_utc=expiration_utc,
             comment=comment,
             magic=magic,
+            client_order_id=client_order_id,
         )
-        return OrderResult.model_validate(
-            self._http.request("POST", "/OrderSend", json=body)
+        return _order_result(
+            *self._http.request_with_headers("POST", "/OrderSend", json=body)
         )
 
     def order_modify(
@@ -447,7 +580,9 @@ class TerminalClient:
         expiration: str | datetime | date | None = None,
         clear_stop_loss: bool = False,
         clear_take_profit: bool = False,
+        expiration_utc: str | datetime | date | None = None,
     ) -> OrderResult:
+        _guard_stop_limit_modify(self.platform, stop_limit_price)
         sl, tp = _resolve_modify_sl_tp(
             stop_loss=stop_loss,
             take_profit=take_profit,
@@ -456,6 +591,7 @@ class TerminalClient:
             price=price,
             stop_limit_price=stop_limit_price,
         )
+        _check_expiration(expiration, expiration_utc)
         body = _order_modify_body(
             ticket=ticket,
             stop_loss=sl,
@@ -463,9 +599,10 @@ class TerminalClient:
             price=price,
             stop_limit_price=stop_limit_price,
             expiration=expiration,
+            expiration_utc=expiration_utc,
         )
-        return OrderResult.model_validate(
-            self._http.request("POST", "/OrderModify", json=body)
+        return _order_result(
+            *self._http.request_with_headers("POST", "/OrderModify", json=body)
         )
 
     def order_close(
@@ -478,8 +615,8 @@ class TerminalClient:
         if volume is not None and volume < 0:
             raise ValidationError(f"volume must be >= 0, got {volume}")
         body = _clean({"ticket": ticket, "volume": volume, "slippage": slippage})
-        return OrderResult.model_validate(
-            self._http.request("POST", "/OrderClose", json=body)
+        return _order_result(
+            *self._http.request_with_headers("POST", "/OrderClose", json=body)
         )
 
     def close_all(
@@ -496,10 +633,12 @@ class TerminalClient:
         ``delete_pending=True`` also deletes matching pending orders. The
         reply carries a per-ticket result for every attempted close/delete.
 
-        Positions opened while the pass is running are not covered, and on a
-        504 (:class:`~fxsocket.TerminalTimeoutError`) the pass *continues to
-        completion inside the terminal* — check :meth:`opened_orders` before
-        acting again rather than re-sending.
+        Positions opened while the pass is running are not covered. A
+        :class:`~fxsocket.TradeOutcomeUnknownError` (or, on older bridges, any
+        :class:`~fxsocket.TerminalTimeoutError`) means the pass *continues to
+        completion inside the terminal*: check :meth:`opened_orders` before
+        acting again rather than re-sending. Only a
+        :class:`~fxsocket.TradeAbandonedError` means nothing was attempted.
         """
         body = _close_all_body(
             symbol=symbol, magic=magic, delete_pending=delete_pending
@@ -580,6 +719,11 @@ class AsyncTerminalClient:
         rows = await self._http.request("GET", "/OpenedOrders")
         return [OpenedOrder.model_validate(r) for r in rows]
 
+    async def pending_orders(self) -> list[PendingOrder]:
+        """Async mirror of :meth:`TerminalClient.pending_orders`."""
+        rows = await self._http.request("GET", "/PendingOrders")
+        return [PendingOrder.model_validate(r) for r in rows]
+
     async def order_history(
         self,
         from_: str | datetime | date | None = None,
@@ -615,6 +759,23 @@ class AsyncTerminalClient:
         return SymbolInfo.model_validate(
             await self._http.request("GET", "/SymbolInfo", params={"symbol": symbol})
         )
+
+    async def symbol_infos(self, symbols: Sequence[str]) -> SymbolInfoBatch:
+        """Async mirror of :meth:`TerminalClient.symbol_infos`."""
+        names = _check_symbols(symbols)
+        return SymbolInfoBatch.model_validate(
+            await self._http.request(
+                "GET", "/SymbolInfo", params={"symbols": ",".join(names)}
+            )
+        )
+
+    async def symbol_select(self, symbols: Sequence[str]) -> list[SymbolSelectResult]:
+        """Async mirror of :meth:`TerminalClient.symbol_select`."""
+        names = _check_symbols(symbols)
+        rows = await self._http.request(
+            "POST", "/SymbolSelect", json={"symbols": names}
+        )
+        return [SymbolSelectResult.model_validate(r) for r in rows]
 
     async def price_history(
         self,
@@ -685,8 +846,11 @@ class AsyncTerminalClient:
         expiration: str | datetime | date | None = None,
         comment: str | None = None,
         magic: int | None = None,
+        expiration_utc: str | datetime | date | None = None,
+        client_order_id: str | None = None,
     ) -> OrderResult:
         op = coerce_operation(operation)
+        _guard_stop_limit_send(self.platform, op)
         _validate_order_send(
             op,
             volume=volume,
@@ -695,6 +859,8 @@ class AsyncTerminalClient:
             stop_loss=stop_loss,
             take_profit=take_profit,
         )
+        _check_expiration(expiration, expiration_utc)
+        _check_client_order_id(client_order_id)
         body = _order_send_body(
             symbol=symbol,
             operation=op,
@@ -705,11 +871,13 @@ class AsyncTerminalClient:
             take_profit=take_profit,
             stop_limit_price=stop_limit_price,
             expiration=expiration,
+            expiration_utc=expiration_utc,
             comment=comment,
             magic=magic,
+            client_order_id=client_order_id,
         )
-        return OrderResult.model_validate(
-            await self._http.request("POST", "/OrderSend", json=body)
+        return _order_result(
+            *await self._http.request_with_headers("POST", "/OrderSend", json=body)
         )
 
     async def order_modify(
@@ -723,7 +891,9 @@ class AsyncTerminalClient:
         expiration: str | datetime | date | None = None,
         clear_stop_loss: bool = False,
         clear_take_profit: bool = False,
+        expiration_utc: str | datetime | date | None = None,
     ) -> OrderResult:
+        _guard_stop_limit_modify(self.platform, stop_limit_price)
         sl, tp = _resolve_modify_sl_tp(
             stop_loss=stop_loss,
             take_profit=take_profit,
@@ -732,6 +902,7 @@ class AsyncTerminalClient:
             price=price,
             stop_limit_price=stop_limit_price,
         )
+        _check_expiration(expiration, expiration_utc)
         body = _order_modify_body(
             ticket=ticket,
             stop_loss=sl,
@@ -739,9 +910,10 @@ class AsyncTerminalClient:
             price=price,
             stop_limit_price=stop_limit_price,
             expiration=expiration,
+            expiration_utc=expiration_utc,
         )
-        return OrderResult.model_validate(
-            await self._http.request("POST", "/OrderModify", json=body)
+        return _order_result(
+            *await self._http.request_with_headers("POST", "/OrderModify", json=body)
         )
 
     async def order_close(
@@ -754,8 +926,8 @@ class AsyncTerminalClient:
         if volume is not None and volume < 0:
             raise ValidationError(f"volume must be >= 0, got {volume}")
         body = _clean({"ticket": ticket, "volume": volume, "slippage": slippage})
-        return OrderResult.model_validate(
-            await self._http.request("POST", "/OrderClose", json=body)
+        return _order_result(
+            *await self._http.request_with_headers("POST", "/OrderClose", json=body)
         )
 
     async def close_all(

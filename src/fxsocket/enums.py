@@ -28,9 +28,11 @@ class TradingStatus(str, Enum):
 class OrderOperation(str, Enum):
     """Order operation accepted by the terminal ``/OrderSend``.
 
-    All eight are accepted by both the MT4 and MT5 terminal APIs (the MT4
-    server's ``parse_operation`` maps ``BuyStopLimit``/``SellStopLimit`` too),
-    so the SDK does not gate operations by platform.
+    MT5 accepts all eight. MT4 has no stop-limit order type: its terminal
+    API rejects ``BuyStopLimit``/``SellStopLimit`` (HTTP 400
+    ``MRPC_UNSUPPORTED``), so the SDK raises
+    :class:`~fxsocket.UnsupportedOnPlatformError` for them on MT4 before
+    anything is sent.
     """
 
     BUY = "Buy"
@@ -214,7 +216,67 @@ class DealEntry(str, Enum):
     IN = "In"
     OUT = "Out"
     IN_OUT = "InOut"
+    OUT_BY = "OutBy"
     UNKNOWN = "Unknown"
+
+
+class OrderEventKind(str, Enum):
+    """Step in a pending order's life, on the ``orders`` stream
+    (``OrderEventData.event``)."""
+
+    PLACED = "placed"
+    MODIFIED = "modified"  #: price, stops, expiry, volume or type changed
+    DELETED = "deleted"
+    EXPIRED = "expired"
+    TRIGGERED = "triggered"  #: it filled; ``position`` is the resulting position
+
+
+class ExpirationMode(str, Enum):
+    """How a pending order expires (``PendingOrder.expiration_mode``, and the
+    modes a symbol allows in ``SymbolInfo.expiration_modes``).
+
+    MT4 only knows ``GTC`` and ``SPECIFIED``.
+    """
+
+    GTC = "gtc"  #: until cancelled
+    DAY = "day"  #: end of the trading day
+    SPECIFIED = "specified"  #: a given date and time
+    SPECIFIED_DAY = "specifiedDay"  #: end of a given day
+
+
+class TerminalErrorCode(str, Enum):
+    """The fixed ``error`` codes of the terminal API (``FxSocketError.code``).
+
+    Branch on these, never on the message. Bridges before MT5 0.17.0 /
+    MT4 0.15.0 answered most failures with the generic ``MRPC`` instead.
+    """
+
+    UNAUTHORIZED = "UNAUTHORIZED"  #: 401, missing or wrong key
+    READ_ONLY_KEY = "READ_ONLY_KEY"  #: 403, a read-only key on a trade route
+    MRPC_VALIDATION = "MRPC_VALIDATION"  #: 400, bad request parameters
+    MRPC_UNKNOWN_TICKET = "MRPC_UNKNOWN_TICKET"  #: 400, no such order/position
+    MRPC_UNKNOWN_SYMBOL = "MRPC_UNKNOWN_SYMBOL"  #: 400, no such symbol
+    MRPC_BAD_TIMEFRAME = "MRPC_BAD_TIMEFRAME"  #: 400, timeframe not recognized
+    MRPC_UNSUPPORTED = "MRPC_UNSUPPORTED"  #: 400, MT4 cannot do this
+    #: 500, the symbol has no quote yet (warm it with ``symbol_select``)
+    MRPC_SYMBOL_NOT_QUOTING = "MRPC_SYMBOL_NOT_QUOTING"
+    #: 500, another request for this ticket is still at the dealer
+    MRPC_TICKET_BUSY = "MRPC_TICKET_BUSY"
+    #: 409, ``client_order_id`` already used for a different order
+    MRPC_CLIENT_ORDER_ID_REUSED = "MRPC_CLIENT_ORDER_ID_REUSED"
+    MRPC_TRADE_EA_NOT_READY = "MRPC_TRADE_EA_NOT_READY"  #: 503, nothing executed
+    MRPC_TRADE_EA_STOPPED = "MRPC_TRADE_EA_STOPPED"  #: 500, nothing executed
+    #: 504, gave up before the terminal took the command (not executed)
+    MRPC_ABANDONED = "MRPC_ABANDONED"
+    MRPC_TIMEOUT = "MRPC_TIMEOUT"  #: 504, a read timed out
+    #: 504, a trade timed out after the terminal took it (may have executed)
+    MRPC_TRADE_OUTCOME_UNKNOWN = "MRPC_TRADE_OUTCOME_UNKNOWN"
+    MRPC_HISTORY_UNAVAILABLE = "MRPC_HISTORY_UNAVAILABLE"  #: 500
+    MRPC_PRICE_HISTORY_UNAVAILABLE = "MRPC_PRICE_HISTORY_UNAVAILABLE"  #: 500
+    MRPC_CALC_FAILED = "MRPC_CALC_FAILED"  #: 500
+    MRPC_INTERNAL = "MRPC_INTERNAL"  #: 500, bridge fault
+    MRPC_UNKNOWN_COMMAND = "MRPC_UNKNOWN_COMMAND"  #: 500, bridge fault
+    MRPC = "MRPC"  #: generic code of bridges before MT5 0.17.0 / MT4 0.15.0
 
 
 class HealthStatus(str, Enum):

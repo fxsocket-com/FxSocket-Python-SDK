@@ -18,13 +18,15 @@ interfaces.
 - **Read-only keys** — mint, scope, rotate and revoke `fxs_ro_…` keys for
   dashboards and monitors.
 - **Trading** — market & pending orders, modify, close, close-all, plus margin/profit calculators.
+  Safe retries with a client order id, pending-order expiry in UTC.
 - **Multi-account trading** — one order, or one close, fanned out to several
   accounts in a single request, with idempotency keys for safe retries.
 - **Wallet** — read your prepaid balance, pending top-ups and upcoming charges.
 - **Market data** — quotes, symbol specifications (incl. commission rules & trading
   sessions), OHLC history, account state & info.
-- **Live streaming** — ticks, bars, account, positions, trades, and terminal status
-  over WebSocket, with automatic reconnect + subscription replay.
+- **Live streaming** — ticks, bars, account, positions, trades, pending orders and
+  terminal status over WebSocket, with automatic reconnect + subscription replay,
+  and missed deals replayed after a reconnect.
 - **Sync *and* async** — `Client` / `AsyncClient`, method-for-method mirrors.
 - **Typed** — Pydantic v2 models throughout; ships `py.typed`.
 - **One interface for MT4 and MT5** — platform differences handled for you.
@@ -189,8 +191,9 @@ There's also a panic button. `close_all()` closes every open position in one
 trade-EA pass — optionally filtered by `symbol` and/or `magic` (`magic=0`
 matches manually-opened orders), and `delete_pending=True` also deletes
 matching pending orders. It returns a `CloseAllSummary` with per-ticket
-results. On a 504 the pass *continues inside the terminal* — check
-`opened_orders()` before acting again rather than re-sending:
+results. On a `TradeOutcomeUnknownError` (any `TerminalTimeoutError` on older
+bridges) the pass *continues inside the terminal*, so check `opened_orders()`
+before acting again rather than re-sending:
 
 ```python
 summary = term.close_all(symbol="EURUSD", delete_pending=True)
@@ -199,6 +202,84 @@ if summary.failed:
         if not r.success:
             print(r.ticket, r.retcode, r.retcode_description)
 ```
+
+### Safe retries
+
+No order call is retried by the SDK. To retry one yourself, give `order_send`
+a `client_order_id` (1 to 64 characters, remembered by the terminal for 10
+minutes). The terminal trades an id once; any repeat trades nothing and gets
+the first answer back, with `result.idempotent_replayed` set:
+
+```python
+from fxsocket import TradeAbandonedError, TradeOutcomeUnknownError
+
+order = dict(symbol="EURUSD", operation="Buy", volume=0.10,
+             client_order_id="copy-7f3a-0001")
+try:
+    result = term.order_send(**order)
+except (TradeOutcomeUnknownError, TradeAbandonedError):
+    result = term.order_send(**order)   # safe: same id, traded at most once
+```
+
+A 504 now says what happened:
+
+| Exception | Meaning |
+|---|---|
+| `TradeOutcomeUnknownError` | the terminal took the trade, then timed out; it **may have executed**. Resend only with the same `client_order_id`, or reconcile via `opened_orders()` / `order_history()` |
+| `TradeAbandonedError` | the trade never reached the terminal; nothing executed, resending is safe |
+| `TerminalTimeoutError` | base class of both; raised directly for a read that timed out |
+
+On bridges older than MT5 0.17.0 / MT4 0.15.0 a trade timeout raises a plain
+`TerminalTimeoutError` that may have executed, so treat it like
+`TradeOutcomeUnknownError` there. Reusing a `client_order_id` for a different
+order raises `ClientOrderIdReusedError`.
+
+Trade replies also carry `position`, the fill `time` (and `time_utc`),
+`remainder_ticket` (MT4: where the rest of a partial close went) and
+`server_timing` (`queue_ms` waiting for the trade EA, `exec_ms` executing).
+
+### Pending orders and expiry
+
+`pending_orders()` lists the resting orders with what a copy needs: `type`,
+`price`, `stop_limit_price`, `sl`/`tp`, `volume_initial`, `volume`,
+`expiration_mode`, `expiration` (server time) and `expiration_utc`.
+
+To set an expiry, pass `expiration_utc` (a UTC moment) instead of
+`expiration` (broker server time), not both. An aware `datetime` is converted
+to UTC, a naive one is taken as UTC already:
+
+```python
+from datetime import datetime, timedelta, timezone
+
+term.order_send(
+    symbol="EURUSD", operation="BuyLimit", volume=0.10, price=1.0800,
+    expiration_utc=datetime.now(timezone.utc) + timedelta(hours=4),
+)
+```
+
+Brokers enforce a minimum distance for expiries (often several minutes). What a
+symbol allows is in `symbol_info(...).expiration_modes` (compare against
+`ExpirationMode`), next to `order_modes` and `filling_modes`.
+
+### Warming symbols
+
+A symbol outside Market Watch gets no quotes, so the first order on it waits
+for a first tick. `symbol_select([...])` puts up to 100 symbols into Market
+Watch in one pass and waits briefly until they quote; `symbol_infos([...])`
+fetches up to 100 specs at once, listing failures in `errors` instead of
+raising:
+
+```python
+for row in term.symbol_select(["EURUSD", "GBPUSD", "XAUUSD"]):
+    if not row.selected:
+        print(row.symbol, "is unknown to this broker")
+
+specs = term.symbol_infos(["EURUSD", "GBPUSD"])
+for err in specs.errors:
+    print(err.symbol, err.error)          # e.g. MRPC_UNKNOWN_SYMBOL
+```
+
+### Validation and platforms
 
 Inputs are validated client-side before they're sent. One guard worth knowing:
 in `order_modify`, a literal `stop_loss=0.0` would *remove* your stop-loss, so
@@ -210,6 +291,10 @@ MT4 and MT5 share one interface, timeframes included. Both accept the same nine:
 `15min`, `30min`, `1h`, `4h`, `1d`, `1w`, `1month`). MT5's other periods, such
 as `H2` or `H12`, aren't served by the terminal API, so anything else raises
 `ValidationError` before any request.
+
+The one platform gate is stop-limit: MT4 has no stop-limit order type, so
+`BuyStopLimit` / `SellStopLimit` (and `stop_limit_price` on `order_modify`)
+raise `UnsupportedOnPlatformError` on MT4 before anything is sent.
 
 > **MT4 history note:** on MT4, `price_history` with `from_`/`to` bounds (or the
 > `D1` timeframe) can fail server-side with `CopyRates failed` when the terminal
@@ -298,9 +383,9 @@ Both calls need the full `fxs_live_…` key — a read-only key raises
 
 ## Streaming (WebSocket)
 
-Subscribe to live ticks, bars, account, positions, trades, and terminal status.
-Streaming is async-first; a synchronous wrapper is provided too. A dropped
-connection auto-reconnects and replays active subscriptions
+Subscribe to live ticks, bars, account, positions, trades, pending orders and
+terminal status. Streaming is async-first; a synchronous wrapper is provided
+too. A dropped connection auto-reconnects and replays active subscriptions
 (`auto_reconnect=True` by default).
 
 ```python
@@ -339,6 +424,13 @@ with Client(api_key="fxs_live_…") as fx:
                 print(event.data.bid, event.data.ask)
 ```
 
+Data events carry the frame envelope (bridges MT5 0.17.0 / MT4 0.15.0 on):
+`seq` numbers a topic's live frames (a gap means frames were dropped for you),
+`ts` is when the bridge sent it (Unix ms, UTC), and `snapshot=True` marks the
+current-state frame sent right after a subscribe. A `StreamWarning` names the
+`topic` that lost frames. The server pings every 5 s; the WebSocket library
+answers by itself, so keep iterating the stream and nothing else is needed.
+
 ### Trade events
 
 A `TradeUpdate` carries the full deal: `commission`, `swap`, `magic` and a
@@ -368,6 +460,53 @@ async for event in s:
             print(t.data.position, "closed, net", t.data.net_profit)
 ```
 
+From bridges MT5 0.17.0 / MT4 0.15.0 on, a deal also carries the position's
+`sl` / `tp`, `position_volume` (volume still open after it; `-1` = unknown)
+and `time_utc`. On MT4 a partial close moves the rest to a new ticket: the
+`Out` of the closed part names it in `remainder_ticket`, and the remainder's
+`In` points back with `remainder_of`. A `ModifyUpdate` on the same topic
+reports an open position's moved SL/TP.
+
+### Trades after a reconnect
+
+With `resume_trades=True` (the default) the stream remembers the newest deal
+`time` it delivered. After an automatic reconnect it resubscribes with that moment
+as `since`, so the terminal replays the deals you missed (`replay=True`, then a
+`Replayed` event) before the live frames continue. Deals that arrive twice
+around the switch-over are dropped (by `deal` on MT5, by `order` + `entry` on
+MT4). You can also start from a known point yourself:
+
+```python
+await s.subscribe_trades(since=last_seen_trade.data.time)   # broker server time
+```
+
+`since` is **broker server time** as the frames print it, not UTC, and the
+replay reaches at most 24 hours back (the newest 1000 deals). A `Replayed`
+with `truncated=True`, or an error frame for a longer gap, means you should
+reconcile via `order_history()`. Pass `resume_trades=False` to
+`fx.stream(...)` to get exactly the frames the server sends. Bridges older
+than MT5 0.17.0 / MT4 0.15.0 ignore `since` (no replay).
+
+### Pending orders stream
+
+`subscribe_orders()` first sends an `OrdersUpdate` snapshot of the resting
+orders, then an `OrderUpdate` per step of an order's life. `data.event` is
+`placed`, `modified`, `deleted`, `expired` or `triggered` (compare against
+`OrderEventKind`); on `triggered`, `data.position` is the position the fill
+opened or added to.
+
+```python
+from fxsocket import OrderEventKind, OrdersUpdate, OrderUpdate
+
+await s.subscribe_orders()
+async for event in s:
+    match event:
+        case OrdersUpdate():
+            book = {o.ticket: o for o in event.data}
+        case OrderUpdate() as o if o.data.event == OrderEventKind.TRIGGERED:
+            print(o.data.ticket, "filled into position", o.data.position)
+```
+
 ## Errors
 
 Every failure raises a subclass of `fxsocket.FxSocketError`:
@@ -387,8 +526,16 @@ Every failure raises a subclass of `fxsocket.FxSocketError`:
 | `SeatLapsedError` | seats lapsed, existing accounts unseated — renew first |
 | `DuplicateAccountError` | account already linked |
 | `ConnectFailedError` | broker rejected the login |
-| `TerminalNotReadyError` | terminal not provisioned / not ready |
-| `UnsupportedOnPlatformError` | feature not available on this platform |
+| `ClientOrderIdReusedError` | `client_order_id` already used for a different order |
+| `TerminalNotReadyError` | terminal not provisioned / not ready (nothing executed) |
+| `TerminalTimeoutError` | the terminal didn't answer in time (base of the two below) |
+| `TradeOutcomeUnknownError` | a trade timed out after the terminal took it; may have executed |
+| `TradeAbandonedError` | a trade never reached the terminal; safe to resend |
+| `UnsupportedOnPlatformError` | feature not available on this platform (stop-limit on MT4) |
+
+Terminal errors carry a fixed code in `.code`; branch on it (compare against
+`TerminalErrorCode`, e.g. `MRPC_UNKNOWN_SYMBOL`, `MRPC_SYMBOL_NOT_QUOTING`),
+never on the message.
 
 ```python
 from fxsocket import Client, AccountCapError, InsufficientBalanceError
@@ -529,6 +676,10 @@ Terminal timestamps (`quote.time`, candle `time`, order times) are returned as
 **strings in broker server time** — not Python `datetime`. The trailing `Z` is
 stylistic and does **not** mean UTC. Use `terminal.server_timezone()` to get the
 broker's UTC offset if you need to convert.
+
+Fields named `…_utc` (`time_utc`, `expiration_utc`) are real UTC. They are
+set on live data (trade replies, stream frames, pending orders) by bridges
+MT5 0.17.0 / MT4 0.15.0 on; history endpoints stay in server time.
 
 ## Requirements
 

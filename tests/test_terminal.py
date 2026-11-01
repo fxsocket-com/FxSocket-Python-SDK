@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -11,11 +12,17 @@ import respx
 from fxsocket import (
     AsyncClient,
     Client,
+    ClientOrderIdReusedError,
+    ExpirationMode,
     OrderOperation,
     Platform,
     TerminalNotReadyError,
     TerminalTimeoutError,
     Timeframe,
+    TradeAbandonedError,
+    TradeOutcomeUnknownError,
+    UnsupportedOnPlatformError,
+    ValidationError,
 )
 from fxsocket.models import Account
 from fxsocket.terminal.client import (
@@ -318,13 +325,30 @@ def test_order_send_body_and_aliases() -> None:
 
 
 @respx.mock
-def test_order_send_allows_stop_limit_on_mt4() -> None:
-    # MT4's terminal API accepts BuyStopLimit/SellStopLimit (parse_operation
-    # maps them), so the SDK must NOT block them client-side.
+@pytest.mark.parametrize("op", ["BuyStopLimit", "SellStopLimit"])
+def test_order_send_stop_limit_unsupported_on_mt4(op: str) -> None:
+    # MT4 has no stop-limit order type; the bridge answers 400
+    # MRPC_UNSUPPORTED, so the SDK refuses before sending.
     route = respx.post(f"{TERM}/OrderSend").mock(
         return_value=httpx.Response(200, json=_ORDER_OK),
     )
-    with _term(platform="mt4") as t:
+    with _term(platform="mt4") as t, pytest.raises(UnsupportedOnPlatformError):
+        t.order_send(
+            symbol="EURUSD",
+            operation=op,
+            volume=0.1,
+            price=1.1,
+            stop_limit_price=1.09,
+        )
+    assert not route.called
+
+
+@respx.mock
+def test_order_send_stop_limit_allowed_on_mt5() -> None:
+    route = respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK),
+    )
+    with _term(platform="mt5") as t:
         t.order_send(
             symbol="EURUSD",
             operation="BuyStopLimit",
@@ -335,6 +359,21 @@ def test_order_send_allows_stop_limit_on_mt4() -> None:
     sent = json.loads(route.calls.last.request.content)
     assert sent["operation"] == "BuyStopLimit"
     assert sent["stopLimitPrice"] == 1.09
+
+
+@respx.mock
+def test_order_modify_stop_limit_price_unsupported_on_mt4() -> None:
+    # MT4 would silently ignore stopLimitPrice on modify.
+    route = respx.post(f"{TERM}/OrderModify").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK),
+    )
+    with _term(platform="mt4") as t, pytest.raises(UnsupportedOnPlatformError):
+        t.order_modify(100, stop_limit_price=1.09)
+    assert not route.called
+    # The rest of a modify still works on MT4.
+    with _term(platform="mt4") as t:
+        t.order_modify(100, price=1.1)
+    assert route.called
 
 
 @respx.mock
@@ -945,3 +984,456 @@ async def test_async_close_all() -> None:
         summary = await term.close_all(symbol="EURUSD")
     assert json.loads(route.calls.last.request.content) == {"symbol": "EURUSD"}
     assert summary.closed == 1 and summary.results[0].success
+
+
+# --------------------------------------------------------------------------- #
+# Bridge MT5 0.17.0 / MT4 0.15.0: pending orders, symbols, trade replies
+# --------------------------------------------------------------------------- #
+
+_PENDING = {
+    "ticket": 555,
+    "symbol": "EURUSD",
+    "type": "BuyLimit",
+    "volumeInitial": 0.2,
+    "volume": 0.2,
+    "price": 1.08,
+    "stopLimitPrice": 0.0,
+    "sl": 1.075,
+    "tp": 1.09,
+    "expirationMode": "specified",
+    "expiration": "2026-11-03T19:00:00Z",
+    "expirationUtc": "2026-11-03T17:00:00Z",
+    "magic": 7,
+    "comment": "copy",
+    "time": "2026-10-30T10:00:00.123Z",
+    "timeUtc": "2026-10-30T08:00:00.123Z",
+}
+
+
+@respx.mock
+def test_pending_orders_parse() -> None:
+    respx.get(f"{TERM}/PendingOrders").mock(
+        return_value=httpx.Response(200, json=[_PENDING])
+    )
+    with _term() as t:
+        rows = t.pending_orders()
+    assert len(rows) == 1
+    po = rows[0]
+    assert po.ticket == 555 and po.volume_initial == 0.2
+    assert po.expiration_mode == ExpirationMode.SPECIFIED
+    assert po.expiration_utc == "2026-11-03T17:00:00Z"
+    assert po.time_utc == "2026-10-30T08:00:00.123Z"
+
+
+def test_pending_order_time_utc_absent_is_none() -> None:
+    from fxsocket import PendingOrder
+
+    row = {k: v for k, v in _PENDING.items() if k != "timeUtc"}
+    assert PendingOrder.model_validate(row).time_utc is None
+
+
+@respx.mock
+def test_symbol_select_sends_list_and_parses() -> None:
+    route = respx.post(f"{TERM}/SymbolSelect").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"symbol": "EURUSD", "selected": True, "quoting": True},
+                {"symbol": "NOPE", "selected": False, "quoting": False},
+            ],
+        )
+    )
+    with _term() as t:
+        rows = t.symbol_select(["EURUSD", "NOPE"])
+    assert json.loads(route.calls.last.request.content) == {
+        "symbols": ["EURUSD", "NOPE"]
+    }
+    assert rows[0].quoting is True and rows[1].selected is False
+
+
+_SPEC = {
+    "symbol": "EURUSD",
+    "description": "Euro vs US Dollar",
+    "digits": 5,
+    "point": 0.00001,
+    "tickSize": 0.00001,
+    "tickValue": 1.0,
+    "contractSize": 100000.0,
+    "volumeMin": 0.01,
+    "volumeMax": 100.0,
+    "volumeStep": 0.01,
+    "stopsLevel": 0,
+    "freezeLevel": 0,
+    "spread": 2,
+    "tradeMode": "Full",
+    "swapLong": -1.0,
+    "swapShort": 0.5,
+    "bid": 1.0849,
+    "ask": 1.0851,
+    "currencyBase": "EUR",
+    "currencyProfit": "USD",
+    "currencyMargin": "EUR",
+    "orderModes": ["market", "limit", "stop", "stopLimit", "sl", "tp"],
+    "expirationModes": ["gtc", "day", "specified", "specifiedDay"],
+    "fillingModes": ["fok", "ioc"],
+}
+
+
+@respx.mock
+def test_symbol_infos_bulk() -> None:
+    route = respx.get(f"{TERM}/SymbolInfo").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "symbols": [_SPEC],
+                "errors": [
+                    {
+                        "symbol": "NOPE",
+                        "error": "MRPC_UNKNOWN_SYMBOL",
+                        "message": "unknown symbol",
+                    }
+                ],
+            },
+        )
+    )
+    with _term() as t:
+        batch = t.symbol_infos(["EURUSD", "NOPE"])
+    assert route.calls.last.request.url.params["symbols"] == "EURUSD,NOPE"
+    assert "symbol" not in route.calls.last.request.url.params
+    assert batch.symbols[0].filling_modes == ["fok", "ioc"]
+    assert "stopLimit" in batch.symbols[0].order_modes
+    assert batch.errors[0].symbol == "NOPE"
+    assert batch.errors[0].error == "MRPC_UNKNOWN_SYMBOL"
+
+
+def test_symbol_info_modes_default_empty() -> None:
+    from fxsocket import SymbolInfo
+
+    spec = {
+        k: v
+        for k, v in _SPEC.items()
+        if k not in ("orderModes", "expirationModes", "fillingModes")
+    }
+    info = SymbolInfo.model_validate(spec)
+    assert info.order_modes == [] and info.expiration_modes == []
+    assert info.filling_modes == []
+
+
+@pytest.mark.parametrize(
+    "symbols",
+    [[], "EURUSD", ["EURUSD", ""], ["EUR,USD"], [f"S{i}" for i in range(101)]],
+)
+def test_symbol_lists_validated(symbols: object) -> None:
+    with _term() as t:
+        with pytest.raises(ValidationError):
+            t.symbol_select(symbols)  # type: ignore[arg-type]
+        with pytest.raises(ValidationError):
+            t.symbol_infos(symbols)  # type: ignore[arg-type]
+
+
+@respx.mock
+def test_symbol_lists_accept_100() -> None:
+    respx.post(f"{TERM}/SymbolSelect").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    with _term() as t:
+        assert t.symbol_select([f"S{i}" for i in range(100)]) == []
+
+
+@respx.mock
+def test_order_send_client_order_id_and_reply_fields() -> None:
+    reply = {
+        **_ORDER_OK,
+        "deal": 900,
+        "position": 100,
+        "time": "2026-10-30T10:00:00.123Z",
+        "timeUtc": "2026-10-30T08:00:00.123Z",
+        "remainderTicket": 0,
+        "clientOrderId": "copy-1",
+    }
+    route = respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(
+            200,
+            json=reply,
+            headers={
+                "Idempotent-Replayed": "true",
+                "Server-Timing": "queue;dur=1.5, exec;dur=40.25",
+            },
+        )
+    )
+    with _term() as t:
+        res = t.order_send(
+            symbol="EURUSD", operation="Buy", volume=0.1, client_order_id="copy-1"
+        )
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["clientOrderId"] == "copy-1"
+    assert res.position == 100
+    assert res.time_utc == "2026-10-30T08:00:00.123Z"
+    assert res.client_order_id == "copy-1"
+    assert res.idempotent_replayed is True
+    assert res.server_timing is not None
+    assert res.server_timing.queue_ms == 1.5
+    assert res.server_timing.exec_ms == 40.25
+
+
+@respx.mock
+def test_trade_reply_without_new_headers_defaults() -> None:
+    respx.post(f"{TERM}/OrderClose").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    with _term() as t:
+        res = t.order_close(100)
+    assert res.idempotent_replayed is False
+    assert res.server_timing is None
+    assert res.position == 0 and res.time == "" and res.time_utc is None
+    assert res.remainder_ticket == 0 and res.client_order_id is None
+
+
+@respx.mock
+def test_order_close_reply_remainder_ticket_mt4() -> None:
+    respx.post(f"{TERM}/OrderClose").mock(
+        return_value=httpx.Response(
+            200,
+            json={**_ORDER_OK, "position": 100, "remainderTicket": 101},
+            headers={"idempotent-replayed": "TRUE", "server-timing": "exec;dur=12"},
+        )
+    )
+    with _term(platform="mt4") as t:
+        res = t.order_close(100, volume=0.05)
+    assert res.remainder_ticket == 101
+    assert res.idempotent_replayed is True
+    assert res.server_timing is not None
+    assert res.server_timing.queue_ms is None and res.server_timing.exec_ms == 12.0
+
+
+@pytest.mark.parametrize(
+    "header,queue,exec_",
+    [
+        ("queue;dur=1.2, exec;dur=40.3", 1.2, 40.3),
+        ('exec;desc="x";dur=7, queue;dur="0.5"', 0.5, 7.0),
+        ("queue;dur=abc, exec;dur=3", None, 3.0),
+    ],
+)
+def test_server_timing_parse(header: str, queue: float | None, exec_: float) -> None:
+    from fxsocket import ServerTiming
+
+    st = ServerTiming.from_header(header)
+    assert st is not None
+    assert st.queue_ms == queue and st.exec_ms == exec_
+
+
+@pytest.mark.parametrize("header", [None, "", "db;dur=3", "queue"])
+def test_server_timing_parse_nothing(header: str | None) -> None:
+    from fxsocket import ServerTiming
+
+    assert ServerTiming.from_header(header) is None
+
+
+@pytest.mark.parametrize("bad", ["", "x" * 65, 123])
+def test_order_send_client_order_id_validated(bad: object) -> None:
+    with _term() as t, pytest.raises(ValidationError):
+        t.order_send(
+            symbol="EURUSD",
+            operation="Buy",
+            volume=0.1,
+            client_order_id=bad,  # type: ignore[arg-type]
+        )
+
+
+@respx.mock
+def test_order_send_client_order_id_64_chars_ok() -> None:
+    route = respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    with _term() as t:
+        t.order_send(
+            symbol="EURUSD", operation="Buy", volume=0.1, client_order_id="x" * 64
+        )
+    assert json.loads(route.calls.last.request.content)["clientOrderId"] == "x" * 64
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (
+            datetime(2026, 11, 3, 19, 0, 0, tzinfo=timezone(timedelta(hours=2))),
+            "2026-11-03T17:00:00Z",
+        ),
+        (datetime(2026, 11, 3, 17, 0, 0, tzinfo=timezone.utc), "2026-11-03T17:00:00Z"),
+        (datetime(2026, 11, 3, 17, 0, 0, 500000), "2026-11-03T17:00:00Z"),  # naive
+        (date(2026, 11, 3), "2026-11-03T00:00:00Z"),
+        ("2026-11-03T17:00:00Z", "2026-11-03T17:00:00Z"),
+    ],
+)
+def test_order_send_expiration_utc_formatting(value: object, expected: str) -> None:
+    route = respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    with _term() as t:
+        t.order_send(
+            symbol="EURUSD",
+            operation="BuyLimit",
+            volume=0.1,
+            price=1.08,
+            expiration_utc=value,  # type: ignore[arg-type]
+        )
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["expirationUtc"] == expected
+    assert "expiration" not in sent
+
+
+@respx.mock
+def test_order_modify_expiration_utc() -> None:
+    route = respx.post(f"{TERM}/OrderModify").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    with _term() as t:
+        t.order_modify(
+            555, expiration_utc=datetime(2026, 11, 3, 17, 0, tzinfo=timezone.utc)
+        )
+    sent = json.loads(route.calls.last.request.content)
+    assert sent == {"ticket": 555, "expirationUtc": "2026-11-03T17:00:00Z"}
+
+
+def test_expiration_and_expiration_utc_are_exclusive() -> None:
+    with _term() as t:
+        with pytest.raises(ValidationError, match="not both"):
+            t.order_send(
+                symbol="EURUSD",
+                operation="BuyLimit",
+                volume=0.1,
+                price=1.08,
+                expiration="2026-11-03T19:00:00",
+                expiration_utc="2026-11-03T17:00:00Z",
+            )
+        with pytest.raises(ValidationError, match="not both"):
+            t.order_modify(
+                555,
+                expiration="2026-11-03T19:00:00",
+                expiration_utc="2026-11-03T17:00:00Z",
+            )
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "code,exc",
+    [
+        ("MRPC_TRADE_OUTCOME_UNKNOWN", TradeOutcomeUnknownError),
+        ("MRPC_ABANDONED", TradeAbandonedError),
+    ],
+)
+def test_order_send_504_split(code: str, exc: type[Exception]) -> None:
+    respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(
+            504, json={"error": code, "message": "m", "commandId": 9}
+        )
+    )
+    with _term() as t, pytest.raises(exc) as info:
+        t.order_send(symbol="EURUSD", operation="Buy", volume=0.1)
+    # Still a TerminalTimeoutError, so existing handlers keep catching it.
+    assert isinstance(info.value, TerminalTimeoutError)
+
+
+@respx.mock
+def test_order_send_409_client_order_id_reused() -> None:
+    respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(
+            409,
+            json={
+                "error": "MRPC_CLIENT_ORDER_ID_REUSED",
+                "message": "this clientOrderId was already used for a different order",
+                "commandId": 0,
+            },
+        )
+    )
+    with _term() as t, pytest.raises(ClientOrderIdReusedError):
+        t.order_send(
+            symbol="EURUSD", operation="Buy", volume=0.1, client_order_id="dup"
+        )
+
+
+def test_status_trade_pipeline_fields() -> None:
+    from fxsocket.models import BridgeHealth
+
+    b = BridgeHealth.model_validate(
+        {
+            "version": "0.17.0",
+            "tradeEaReady": True,
+            "tradeEaHeartbeatAgeMs": 3,
+            "symbolsSynced": True,
+            "asyncTrades": True,
+            "tradeInFlight": 2,
+            "oldestTradeInFlightAgeMs": 180,
+            "dealerRttMsEwma": 95,
+            "tradeRequestsSent": 41,
+            "lateTradeVerdicts": 0,
+            "tradeQueueDepth": 1,
+            "nonTradeQueueDepth": 0,
+            "tradeDeferred": 1,
+        }
+    )
+    assert b.async_trades is True and b.trade_in_flight == 2
+    assert b.oldest_trade_in_flight_age_ms == 180 and b.dealer_rtt_ms_ewma == 95
+    assert b.trade_requests_sent == 41 and b.trade_deferred == 1
+    old = BridgeHealth.model_validate({"version": "0.14.0"})
+    assert old.oldest_trade_in_flight_age_ms == -1 and old.dealer_rtt_ms_ewma == -1
+    assert old.async_trades is False and old.trade_queue_depth == 0
+
+
+@respx.mock
+async def test_async_new_endpoints() -> None:
+    respx.get(f"{TERM}/PendingOrders").mock(
+        return_value=httpx.Response(200, json=[_PENDING])
+    )
+    respx.post(f"{TERM}/SymbolSelect").mock(
+        return_value=httpx.Response(
+            200, json=[{"symbol": "EURUSD", "selected": True, "quoting": True}]
+        )
+    )
+    respx.get(f"{TERM}/SymbolInfo").mock(
+        return_value=httpx.Response(200, json={"symbols": [_SPEC], "errors": []})
+    )
+    send = respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(
+            200,
+            json={**_ORDER_OK, "clientOrderId": "a"},
+            headers={"Idempotent-Replayed": "true"},
+        )
+    )
+    async with AsyncClient(api_key="fxs_live_k") as fx:
+        term = fx.terminal(_account())
+        assert (await term.pending_orders())[0].ticket == 555
+        assert (await term.symbol_select(["EURUSD"]))[0].quoting is True
+        assert (await term.symbol_infos(["EURUSD"])).symbols[0].symbol == "EURUSD"
+        res = await term.order_send(
+            symbol="EURUSD",
+            operation="BuyLimit",
+            volume=0.1,
+            price=1.08,
+            expiration_utc=datetime(2026, 11, 3, 17, 0, tzinfo=timezone.utc),
+            client_order_id="a",
+        )
+        with pytest.raises(ValidationError):
+            await term.symbol_select([])
+    assert res.idempotent_replayed is True
+    sent = json.loads(send.calls.last.request.content)
+    assert sent["clientOrderId"] == "a"
+    assert sent["expirationUtc"] == "2026-11-03T17:00:00Z"
+
+
+async def test_async_mt4_stop_limit_guard() -> None:
+    term = AsyncTerminalClient(base_url=TERM, api_key="k", platform="mt4")
+    try:
+        with pytest.raises(UnsupportedOnPlatformError):
+            await term.order_send(
+                symbol="EURUSD",
+                operation="SellStopLimit",
+                volume=0.1,
+                price=1.1,
+                stop_limit_price=1.11,
+            )
+        with pytest.raises(UnsupportedOnPlatformError):
+            await term.order_modify(1, stop_limit_price=1.1)
+    finally:
+        await term.aclose()

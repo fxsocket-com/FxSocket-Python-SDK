@@ -5,12 +5,16 @@ from __future__ import annotations
 import httpx
 
 from fxsocket.errors import (
+    ClientOrderIdReusedError,
     ConnectFailedError,
+    DuplicateAccountError,
     FxSocketError,
     NotFoundError,
     RateLimitError,
     TerminalNotReadyError,
     TerminalTimeoutError,
+    TradeAbandonedError,
+    TradeOutcomeUnknownError,
     ValidationError,
     error_from_response,
 )
@@ -108,3 +112,59 @@ def test_402_codes_map_to_typed_errors() -> None:
     unknown = error_from_response(_resp(402, json={"error": "new_code"}))
     assert type(unknown) is PaymentRequiredError
     assert unknown.code == "new_code"
+
+
+def test_504_split_by_code() -> None:
+    unknown = error_from_response(
+        _resp(504, json={"error": "MRPC_TRADE_OUTCOME_UNKNOWN", "message": "m"})
+    )
+    assert isinstance(unknown, TradeOutcomeUnknownError)
+    assert isinstance(unknown, TerminalTimeoutError)
+    assert unknown.code == "MRPC_TRADE_OUTCOME_UNKNOWN"
+
+    abandoned = error_from_response(_resp(504, json={"error": "MRPC_ABANDONED"}))
+    assert isinstance(abandoned, TradeAbandonedError)
+    assert isinstance(abandoned, TerminalTimeoutError)
+
+    read = error_from_response(_resp(504, json={"error": "MRPC_TIMEOUT"}))
+    assert type(read) is TerminalTimeoutError
+    # A 504 without a body (e.g. from a proxy) is a plain timeout too.
+    assert type(error_from_response(_resp(504))) is TerminalTimeoutError
+
+
+def test_409_client_order_id_reused() -> None:
+    err = error_from_response(
+        _resp(409, json={"error": "MRPC_CLIENT_ORDER_ID_REUSED", "message": "m"})
+    )
+    assert isinstance(err, ClientOrderIdReusedError)
+    assert not isinstance(err, DuplicateAccountError)
+    # Other 409s keep their old mapping.
+    assert isinstance(
+        error_from_response(_resp(409, json={"detail": "already linked"})),
+        DuplicateAccountError,
+    )
+
+
+def test_trade_ea_stopped_is_not_ready() -> None:
+    err = error_from_response(
+        _resp(500, json={"error": "MRPC_TRADE_EA_STOPPED", "message": "m"})
+    )
+    assert isinstance(err, TerminalNotReadyError)
+    assert err.status_code == 500
+
+
+def test_unknown_symbol_400_is_validation() -> None:
+    err = error_from_response(
+        _resp(400, json={"error": "MRPC_UNKNOWN_SYMBOL", "message": "unknown"})
+    )
+    assert isinstance(err, ValidationError)
+    assert err.code == "MRPC_UNKNOWN_SYMBOL"
+
+
+def test_terminal_error_code_enum_matches_codes() -> None:
+    from fxsocket import TerminalErrorCode
+
+    for member in TerminalErrorCode:
+        assert member.name == member.value
+    assert TerminalErrorCode.MRPC_ABANDONED == "MRPC_ABANDONED"
+    assert "MRPC" in {c.value for c in TerminalErrorCode}

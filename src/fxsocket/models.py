@@ -763,6 +763,40 @@ class OpenedOrder(_Camel):
         return self.kind.lower() == "pending"
 
 
+class PendingOrder(_Camel):
+    """An active pending order (``GET /PendingOrders``, the ``orders`` stream
+    snapshot, and the body of every ``order`` event).
+
+    ``type`` is ``BuyLimit``, ``SellLimit``, ``BuyStop``, ``SellStop``,
+    ``BuyStopLimit`` or ``SellStopLimit``. ``price`` is the trigger price,
+    ``stop_limit_price`` the limit a stop-limit order turns into (0
+    otherwise, always 0 on MT4). ``volume_initial`` is the lots when placed,
+    ``volume`` the lots still to fill (equal on MT4, which has no partial
+    fills). ``expiration_mode`` compares against
+    :class:`fxsocket.ExpirationMode`; ``expiration`` is broker server time
+    (empty when the order does not expire) and ``expiration_utc`` the same
+    moment in real UTC. ``time`` is when it was placed (server time);
+    ``time_utc`` is ``None`` until the bridge has read the server clock.
+    """
+
+    ticket: int
+    symbol: str
+    type: str
+    volume_initial: float = 0.0
+    volume: float = 0.0
+    price: float = 0.0
+    stop_limit_price: float = 0.0
+    sl: float = 0.0
+    tp: float = 0.0
+    expiration_mode: str = ""
+    expiration: str = ""
+    expiration_utc: str = ""
+    magic: int = 0
+    comment: str = ""
+    time: str = ""
+    time_utc: str | None = None
+
+
 class HistoryTrade(_Camel):
     """A historical deal / closed order (``GET /OrderHistory``).
 
@@ -902,6 +936,13 @@ class SymbolInfo(_Camel):
     windows in broker server time. Both default to empty on pods older than
     bridge 0.10 (and ``commissions`` also when the broker publishes none or
     the terminal predates the API — build 6060+).
+
+    ``order_modes`` (``market``, ``limit``, ``stop``, ``stopLimit``, ``sl``,
+    ``tp``, ``closeBy``), ``expiration_modes`` (compare against
+    :class:`fxsocket.ExpirationMode`) and ``filling_modes`` (``fok``,
+    ``ioc``, ``boc``) are what the broker accepts for the symbol. MT4 reports
+    its fixed set (no stop-limit, ``gtc``/``specified``, no filling
+    policies). They are empty on bridges before MT5 0.17.0 / MT4 0.15.0.
     """
 
     symbol: str
@@ -927,6 +968,40 @@ class SymbolInfo(_Camel):
     currency_margin: str
     commissions: list[CommissionRule] = []
     sessions: list[TradingSession] = []
+    order_modes: list[str] = []
+    expiration_modes: list[str] = []
+    filling_modes: list[str] = []
+
+
+class SymbolInfoError(_Camel):
+    """A symbol ``symbol_infos`` could not describe (``error`` is a
+    :class:`fxsocket.TerminalErrorCode`, e.g. ``MRPC_UNKNOWN_SYMBOL``)."""
+
+    symbol: str
+    error: str = ""
+    message: str = ""
+
+
+class SymbolInfoBatch(_Camel):
+    """Reply of ``GET /SymbolInfo?symbols=…``: the specs that resolved, and
+    one :class:`SymbolInfoError` per symbol that did not."""
+
+    symbols: list[SymbolInfo] = []
+    errors: list[SymbolInfoError] = []
+
+
+class SymbolSelectResult(_Camel):
+    """One row of ``POST /SymbolSelect``.
+
+    ``selected`` means the symbol is in Market Watch (``False``: the broker
+    does not know it). ``quoting`` means it had a live bid/ask when the reply
+    was sent; a freshly selected symbol may need a moment longer, or never
+    quote if the broker lists it without feeding it.
+    """
+
+    symbol: str
+    selected: bool
+    quoting: bool
 
 
 class Candle(_Camel):
@@ -947,6 +1022,42 @@ class Candle(_Camel):
 # --------------------------------------------------------------------------- #
 
 
+class ServerTiming(BaseModel):
+    """The ``Server-Timing`` header of a trade reply, in milliseconds.
+
+    ``queue_ms`` is the wait until the trade EA picked the request up,
+    ``exec_ms`` the time in the EA and at the dealer. A metric the header
+    does not carry is ``None``.
+    """
+
+    queue_ms: float | None = None
+    exec_ms: float | None = None
+
+    @classmethod
+    def from_header(cls, value: str | None) -> ServerTiming | None:
+        """Parse ``queue;dur=1.2, exec;dur=40.3``. ``None`` when the header
+        is absent or names neither metric."""
+        if not value:
+            return None
+        found: dict[str, float] = {}
+        for metric in value.split(","):
+            name, _, params = metric.strip().partition(";")
+            name = name.strip().lower()
+            if name not in ("queue", "exec"):
+                continue
+            for param in params.split(";"):
+                key, _, raw = param.strip().partition("=")
+                if key.strip().lower() != "dur":
+                    continue
+                try:
+                    found[name] = float(raw.strip().strip('"'))
+                except ValueError:
+                    pass
+        if not found:
+            return None
+        return cls(queue_ms=found.get("queue"), exec_ms=found.get("exec"))
+
+
 class OrderResult(_Camel):
     """Result of an order send / modify / close.
 
@@ -963,6 +1074,22 @@ class OrderResult(_Camel):
 
     ``deal`` is the executed deal ticket (0 for pending placement, and always
     0 on MT4); ``order`` is the resulting position / pending-order ticket.
+
+    From bridges MT5 0.17.0 / MT4 0.15.0 on (defaults before that):
+
+    * ``position``: the position the trade opened or acted on (MT4: the
+      order ticket); 0 for a pending order.
+    * ``time``: when it filled, broker server time with milliseconds; empty
+      when nothing filled (a modify, a pending order, a rejection).
+      ``time_utc`` is the same moment in real UTC, ``None`` when unknown.
+    * ``remainder_ticket``: MT4 only, the ticket the rest of a partial
+      close moved to (always 0 on MT5, where a position keeps its id).
+    * ``client_order_id``: echoed from the request.
+    * ``idempotent_replayed``: ``True`` when this answer is the stored
+      outcome of an earlier request with the same ``client_order_id``
+      (nothing was traded again).
+    * ``server_timing``: how long the request waited for the trade EA and
+      how long it spent executing, from the ``Server-Timing`` header.
     """
 
     success: bool
@@ -976,6 +1103,13 @@ class OrderResult(_Camel):
     bid: float
     ask: float
     comment: str
+    position: int = 0
+    time: str = ""
+    time_utc: str | None = None
+    remainder_ticket: int = 0
+    client_order_id: str | None = None
+    idempotent_replayed: bool = False
+    server_timing: ServerTiming | None = None
 
     @property
     def is_no_change(self) -> bool:
@@ -1082,12 +1216,41 @@ class BridgeHealth(_Camel):
     dispatcher progress (``-1`` = never registered, or a pod older than
     bridge 0.10). A large age while ``trade_ea_ready`` is still ``True``
     means the EA is blocked in a long dealer call or dead — worth alerting on.
+
+    The trade-pipeline fields (bridges MT5 0.16.0 / MT4 0.14.0 on, defaults
+    before that):
+
+    * ``async_trades``: several trade requests can be at the dealer at once
+      (always ``False`` on MT4, which executes one after another).
+    * ``trade_in_flight``: requests awaiting a dealer verdict.
+    * ``oldest_trade_in_flight_age_ms``: age of the oldest of them (``-1`` =
+      idle). **This is the stall signal to alert on** (a value far above
+      ``dealer_rtt_ms_ewma`` means the dealer went quiet), not the heartbeat
+      age.
+    * ``dealer_rtt_ms_ewma``: measured dealer round-trip (``-1`` = no sample).
+    * ``trade_requests_sent``: trade commands handed to the terminal since
+      boot (a ``close_all`` counts once).
+    * ``late_trade_verdicts``: verdicts that arrived after the bridge gave up
+      on the command; non-zero means a trade executed unobserved.
+    * ``trade_queue_depth`` / ``non_trade_queue_depth``: trade and read
+      commands waiting to be picked up.
+    * ``trade_deferred``: trade commands held back because another request
+      on the same ticket is still at the dealer (always 0 on MT4).
     """
 
     version: str = ""
     trade_ea_ready: bool = False
     trade_ea_heartbeat_age_ms: int = -1
     symbols_synced: bool = False
+    async_trades: bool = False
+    trade_in_flight: int = 0
+    oldest_trade_in_flight_age_ms: int = -1
+    dealer_rtt_ms_ewma: int = -1
+    trade_requests_sent: int = 0
+    late_trade_verdicts: int = 0
+    trade_queue_depth: int = 0
+    non_trade_queue_depth: int = 0
+    trade_deferred: int = 0
 
 
 class Health(_Camel):
@@ -1149,6 +1312,21 @@ class TradeEventData(_Camel):
     trustworthy, but ``entry`` is ``"Unknown"`` and ``profit`` /
     ``commission`` / ``swap`` / ``magic`` / ``comment`` are zeroed —
     reconcile the deal via ``GET /OrderHistory``.
+
+    From bridges MT5 0.17.0 / MT4 0.15.0 on (defaults before that):
+
+    * ``sl`` / ``tp``: the stops as of this deal (an opening deal carries
+      the stops it opened with, a closing deal the ones the position had);
+      0 = none.
+    * ``position_volume``: the volume still open on the position right
+      after this deal (0 once it is closed, ``-1`` when unknown, e.g. on a
+      degraded frame or an older bridge).
+    * ``time_utc``: ``time`` in real UTC, ``None`` when unknown. MT5
+      ``time`` also carries milliseconds.
+    * ``remainder_ticket`` / ``remainder_of``: MT4 only. A partial close
+      moves the rest of the order to a new ticket; the ``Out`` frame of the
+      closed part names it in ``remainder_ticket``, and the remainder's
+      ``In`` frame points back through ``remainder_of``. Always 0 on MT5.
     """
 
     deal: int
@@ -1166,11 +1344,55 @@ class TradeEventData(_Camel):
     comment: str
     time: str
     degraded: bool = False
+    sl: float = 0.0
+    tp: float = 0.0
+    position_volume: float = -1.0
+    time_utc: str | None = None
+    remainder_ticket: int = 0
+    remainder_of: int = 0
 
     @property
     def net_profit(self) -> float:
         """Deal P&L including costs: ``profit + commission + swap``."""
         return self.profit + self.commission + self.swap
+
+
+class PositionModifyData(_Camel):
+    """A ``modify`` frame on the ``trades`` stream: an open position's SL/TP
+    moved without a deal (volume changes come as ``trade`` frames).
+
+    ``type`` is ``Buy`` or ``Sell``, ``price`` the open price, ``sl`` /
+    ``tp`` the new stops (0 = none). ``time`` is broker server time when the
+    bridge saw the change (whole seconds); ``time_utc`` is ``None`` when
+    unknown.
+    """
+
+    position: int
+    symbol: str
+    type: str
+    volume: float
+    price: float
+    sl: float = 0.0
+    tp: float = 0.0
+    magic: int = 0
+    comment: str = ""
+    time: str = ""
+    time_utc: str | None = None
+
+
+class OrderEventData(PendingOrder):
+    """An ``order`` frame on the ``orders`` stream: one step in a pending
+    order's life.
+
+    ``event`` compares against :class:`fxsocket.OrderEventKind`. The order
+    fields are as of that step (for ``deleted`` / ``expired`` /
+    ``triggered``: as it was last). ``position`` is set on ``triggered``:
+    the position the fill opened or added to (MT4: the order's own ticket);
+    0 otherwise.
+    """
+
+    event: str
+    position: int = 0
 
 
 class TerminalStatusData(_Camel):

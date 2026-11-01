@@ -52,6 +52,18 @@ class SyncHTTP:
         )
         return process_response(resp)
 
+    def request_with_headers(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: Any | None = None,
+    ) -> tuple[Any, httpx.Headers]:
+        """Like :meth:`request`, but also return the response headers."""
+        resp = self._client.request(method, path, params=params, json=json)
+        return process_response(resp), resp.headers
+
 
 class AsyncHTTP:
     """Asynchronous request wrapper over an :class:`httpx.AsyncClient`."""
@@ -72,3 +84,15 @@ class AsyncHTTP:
             method, path, params=params, json=json, headers=headers
         )
         return process_response(resp)
+
+    async def request_with_headers(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: Any | None = None,
+    ) -> tuple[Any, httpx.Headers]:
+        """Like :meth:`request`, but also return the response headers."""
+        resp = await self._client.request(method, path, params=params, json=json)
+        return process_response(resp), resp.headers

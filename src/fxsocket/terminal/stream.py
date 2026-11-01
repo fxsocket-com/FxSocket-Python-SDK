@@ -4,20 +4,43 @@ The wire protocol is identical on both platforms. A connection authenticates
 with ``?api_key=`` (WebSocket upgrades can't carry custom headers), then the
 client subscribes to topics:
 
-================  ==============  =====================================
-topic             needs           yields
-================  ==============  =====================================
-``prices``        symbol          :class:`Tick`
-``bars``          symbol+timeframe :class:`Bar`
-``account``       –               :class:`AccountUpdate`
-``positions``     –               :class:`PositionsUpdate`
-``trades``        –               :class:`TradeUpdate`
-``terminal``      –               :class:`TerminalUpdate`
-================  ==============  =====================================
+================  ================  =========================================
+topic             needs             yields
+================  ================  =========================================
+``prices``        symbol            :class:`Tick`
+``bars``          symbol+timeframe  :class:`Bar`
+``account``       –                 :class:`AccountUpdate`
+``positions``     –                 :class:`PositionsUpdate`
+``trades``        – (``since``)     :class:`TradeUpdate`, :class:`ModifyUpdate`,
+                                    :class:`Replayed`
+``orders``        –                 :class:`OrdersUpdate` (snapshot),
+                                    :class:`OrderUpdate`
+``terminal``      –                 :class:`TerminalUpdate`
+================  ================  =========================================
 
 Plus control events: :class:`StreamWarning` (slow-client drop count),
 :class:`Subscribed` / :class:`Unsubscribed` / :class:`StreamErrorEvent` /
 :class:`Subscriptions`.
+
+Data events carry the frame envelope (bridges MT5 0.17.0 / MT4 0.15.0 on):
+``seq`` numbers the live frames of a topic (a gap means frames were dropped
+for this client), ``ts`` is when the bridge sent the frame (Unix ms, UTC),
+and ``snapshot`` marks the one current-state frame sent right after a
+subscribe (it has no ``seq``). On older bridges ``seq``/``ts`` are ``None``.
+
+The server pings every 5 s and drops a client that has not answered for 30 s;
+the WebSocket library answers those pings by itself, so nothing is needed on
+your side as long as the stream is iterated.
+
+**Trades after a reconnect.** With ``resume_trades`` (the default) the stream
+remembers the newest trade ``time`` it yielded and, after an automatic
+reconnect, resubscribes ``trades`` with ``since`` set to it: the terminal
+first replays the deals from that moment on (``replay=True`` frames, then a
+:class:`Replayed`), then the live frames continue. Deals seen twice around
+the switch-over are dropped. The replay reaches at most 24 h back and covers
+the newest 1000 deals; a :class:`Replayed` with ``truncated=True``, or an
+error frame for a longer gap, means you should reconcile via
+``order_history``.
 
 :class:`AsyncStream` is the primary, async interface; :class:`Stream` is a
 thread-backed synchronous wrapper over it.
@@ -30,8 +53,10 @@ import json
 import queue
 import ssl as _ssl
 import threading
-from collections.abc import AsyncIterator, Iterator
+from collections import deque
+from collections.abc import AsyncIterator, Hashable, Iterator
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -44,6 +69,9 @@ from ..models import (
     AccountSummary,
     Candle,
     OpenedOrder,
+    OrderEventData,
+    PendingOrder,
+    PositionModifyData,
     Quote,
     TerminalStatusData,
     TradeEventData,
@@ -51,18 +79,28 @@ from ..models import (
 from .client import coerce_timeframe
 
 _TOPICS = frozenset(
-    {"account", "positions", "trades", "terminal", "prices", "bars"}
+    {"account", "positions", "trades", "orders", "terminal", "prices", "bars"}
 )
+
+#: How many trade keys the resume dedupe remembers.
+_DEDUPE_WINDOW = 2048
 
 # --------------------------------------------------------------------------- #
 # Events (the tagged union yielded by a stream)
 # --------------------------------------------------------------------------- #
+#
+# Data events end with the frame envelope: ``seq`` (per-topic frame number,
+# ``None`` on snapshots, replays and older bridges), ``ts`` (send time, Unix
+# ms UTC) and ``snapshot``.
 
 
 @dataclass(frozen=True)
 class Tick:
     symbol: str
     data: Quote
+    seq: int | None = None
+    ts: int | None = None
+    snapshot: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,33 +108,104 @@ class Bar:
     symbol: str
     timeframe: str
     data: Candle
+    seq: int | None = None
+    ts: int | None = None
+    snapshot: bool = False
 
 
 @dataclass(frozen=True)
 class AccountUpdate:
     data: AccountSummary
+    seq: int | None = None
+    ts: int | None = None
+    snapshot: bool = False
 
 
 @dataclass(frozen=True)
 class PositionsUpdate:
     data: list[OpenedOrder]
+    seq: int | None = None
+    ts: int | None = None
+    snapshot: bool = False
 
 
 @dataclass(frozen=True)
 class TradeUpdate:
+    """A deal on the ``trades`` stream. ``replay=True`` marks a deal resent
+    by a ``since`` replay (those have no ``seq``)."""
+
     data: TradeEventData
+    seq: int | None = None
+    ts: int | None = None
+    snapshot: bool = False
+    replay: bool = False
+
+
+@dataclass(frozen=True)
+class ModifyUpdate:
+    """An open position's SL/TP moved (``modify`` frame, ``trades`` topic)."""
+
+    data: PositionModifyData
+    seq: int | None = None
+    ts: int | None = None
+    snapshot: bool = False
+
+
+@dataclass(frozen=True)
+class OrderUpdate:
+    """One step in a pending order's life (``order`` frame, ``orders``
+    topic); ``data.event`` says which."""
+
+    data: OrderEventData
+    seq: int | None = None
+    ts: int | None = None
+    snapshot: bool = False
+
+
+@dataclass(frozen=True)
+class OrdersUpdate:
+    """The active pending orders, sent once right after subscribing to
+    ``orders`` (``snapshot`` is ``True``)."""
+
+    data: list[PendingOrder]
+    seq: int | None = None
+    ts: int | None = None
+    snapshot: bool = False
 
 
 @dataclass(frozen=True)
 class TerminalUpdate:
     data: TerminalStatusData
+    seq: int | None = None
+    ts: int | None = None
+    snapshot: bool = False
 
 
 @dataclass(frozen=True)
 class StreamWarning:
-    """The server dropped ``dropped`` messages because this client lagged."""
+    """The server dropped ``dropped`` messages because this client lagged.
+
+    ``topic`` (and ``symbol`` / ``timeframe`` for ``prices`` / ``bars``)
+    names the stream that lost them; empty on older bridges.
+    """
 
     dropped: int
+    topic: str = ""
+    symbol: str = ""
+    timeframe: str = ""
+
+
+@dataclass(frozen=True)
+class Replayed:
+    """A ``since`` replay is complete: ``count`` deals were resent.
+
+    ``truncated=True`` means the terminal hit its replay limit (the newest
+    1000 deals), so older ones are missing: reconcile via ``order_history``.
+    """
+
+    topic: str
+    count: int
+    truncated: bool
 
 
 @dataclass(frozen=True)
@@ -136,8 +245,12 @@ StreamEvent = (
     | AccountUpdate
     | PositionsUpdate
     | TradeUpdate
+    | ModifyUpdate
+    | OrderUpdate
+    | OrdersUpdate
     | TerminalUpdate
     | StreamWarning
+    | Replayed
     | Subscribed
     | Unsubscribed
     | StreamErrorEvent
@@ -146,31 +259,84 @@ StreamEvent = (
 )
 
 
+def _opt_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _envelope(msg: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "seq": _opt_int(msg.get("seq")),
+        "ts": _opt_int(msg.get("ts")),
+        "snapshot": bool(msg.get("snapshot", False)),
+    }
+
+
 def parse_event(msg: dict[str, Any]) -> StreamEvent:
     """Map a decoded server frame to a typed event."""
     t = msg.get("type")
     if t == "tick":
         return Tick(
-            symbol=msg.get("symbol", ""), data=Quote.model_validate(msg["data"])
+            symbol=msg.get("symbol", ""),
+            data=Quote.model_validate(msg["data"]),
+            **_envelope(msg),
         )
     if t == "bar":
         return Bar(
             symbol=msg.get("symbol", ""),
             timeframe=msg.get("timeframe", ""),
             data=Candle.model_validate(msg["data"]),
+            **_envelope(msg),
         )
     if t == "account":
-        return AccountUpdate(data=AccountSummary.model_validate(msg["data"]))
+        return AccountUpdate(
+            data=AccountSummary.model_validate(msg["data"]), **_envelope(msg)
+        )
     if t == "positions":
         return PositionsUpdate(
-            data=[OpenedOrder.model_validate(r) for r in msg.get("data", [])]
+            data=[OpenedOrder.model_validate(r) for r in msg.get("data", [])],
+            **_envelope(msg),
         )
     if t == "trade":
-        return TradeUpdate(data=TradeEventData.model_validate(msg["data"]))
+        return TradeUpdate(
+            data=TradeEventData.model_validate(msg["data"]),
+            replay=bool(msg.get("replay", False)),
+            **_envelope(msg),
+        )
+    if t == "modify":
+        return ModifyUpdate(
+            data=PositionModifyData.model_validate(msg["data"]), **_envelope(msg)
+        )
+    if t == "order":
+        return OrderUpdate(
+            data=OrderEventData.model_validate(msg["data"]), **_envelope(msg)
+        )
+    if t == "orders":
+        return OrdersUpdate(
+            data=[PendingOrder.model_validate(r) for r in msg.get("data", [])],
+            **_envelope(msg),
+        )
     if t == "terminal":
-        return TerminalUpdate(data=TerminalStatusData.model_validate(msg["data"]))
+        return TerminalUpdate(
+            data=TerminalStatusData.model_validate(msg["data"]), **_envelope(msg)
+        )
     if t == "warning":
-        return StreamWarning(dropped=int(msg.get("dropped", 0)))
+        return StreamWarning(
+            dropped=int(msg.get("dropped", 0)),
+            topic=str(msg.get("topic") or ""),
+            symbol=str(msg.get("symbol") or ""),
+            timeframe=str(msg.get("timeframe") or ""),
+        )
+    if t == "replayed":
+        return Replayed(
+            topic=str(msg.get("topic") or "trades"),
+            count=int(msg.get("count", 0)),
+            truncated=bool(msg.get("truncated", False)),
+        )
     if t == "subscribed":
         return Subscribed(topic=msg.get("topic", ""), message=msg.get("message", ""))
     if t == "unsubscribed":
@@ -182,6 +348,35 @@ def parse_event(msg: dict[str, Any]) -> StreamEvent:
     if t == "subscriptions":
         return Subscriptions(data=list(msg.get("data", [])))
     return UnknownEvent(type=str(t or ""), raw=msg)
+
+
+def _parse_frame_time(value: str) -> datetime | None:
+    """A frame's ``time`` as a comparable datetime (``None`` if unparsable).
+
+    The ``Z`` is stylistic (broker server time); it only has to compare
+    consistently. Python 3.10's ``fromisoformat`` does not take ``Z``.
+    """
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _is_newer(candidate: str, current: str) -> bool:
+    """Whether trade time ``candidate`` is later than ``current``."""
+    a, b = _parse_frame_time(candidate), _parse_frame_time(current)
+    if a is not None and b is not None and a != b:
+        return a > b
+    return candidate > current
+
+
+def _trade_key(data: TradeEventData) -> Hashable:
+    """Identity of a deal for the resume dedupe: the deal ticket on MT5;
+    MT4 has none (``deal`` is 0), so its order ticket plus direction."""
+    if data.deal:
+        return ("deal", data.deal)
+    return ("order", data.order, data.entry)
 
 
 # --------------------------------------------------------------------------- #
@@ -210,13 +405,18 @@ def _ssl_context(uri: str, verify: bool) -> _ssl.SSLContext | None:
 
 
 def _sub_payload(
-    topic: str, symbol: str | None, timeframe: str | None
+    topic: str,
+    symbol: str | None,
+    timeframe: str | None,
+    since: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {"action": "subscribe", "topic": topic}
     if symbol is not None:
         payload["symbol"] = symbol
     if timeframe is not None:
         payload["timeframe"] = timeframe
+    if since is not None:
+        payload["since"] = since
     return payload
 
 
@@ -224,12 +424,21 @@ def _validate_sub(
     topic: str,
     symbol: str | None,
     timeframe: Timeframe | str | None,
+    since: str | None = None,
 ) -> str | None:
     """Validate a subscription; returns the canonical timeframe label (or None)."""
     if topic not in _TOPICS:
         raise ValidationError(
             f"unknown topic {topic!r}; one of {sorted(_TOPICS)}"
         )
+    if since is not None:
+        if topic != "trades":
+            raise ValidationError("since only applies to the 'trades' topic")
+        if not isinstance(since, str) or not since.strip():
+            raise ValidationError(
+                "since must be a non-empty broker server time string, e.g. "
+                "the `time` of a trade frame"
+            )
     if topic in ("prices", "bars") and not symbol:
         raise ValidationError(f"topic {topic!r} requires a symbol")
     if topic == "bars":
@@ -258,6 +467,13 @@ class AsyncStream:
 
     With ``auto_reconnect`` (default), a dropped connection is transparently
     re-established and all active subscriptions are replayed.
+
+    With ``resume_trades`` (default) a ``trades`` subscription is resumed
+    from the newest trade ``time`` it yielded after a reconnect, so deals executed
+    while the connection was down are replayed, and duplicate deals are
+    dropped (by ``deal`` on MT5, by ``order`` + ``entry`` on MT4). Set it to
+    ``False`` to get exactly the frames the server sends, with a plain
+    resubscribe after a reconnect.
     """
 
     def __init__(
@@ -271,6 +487,7 @@ class AsyncStream:
         open_timeout: float = 10.0,
         ping_interval: float = 20.0,
         max_reconnect_attempts: int = 5,
+        resume_trades: bool = True,
     ) -> None:
         self.platform = Platform(platform)
         self._uri = _with_api_key(ws_url, api_key)
@@ -285,6 +502,14 @@ class AsyncStream:
         self._lock = asyncio.Lock()
         #: active subscriptions as (topic, symbol, timeframe), replayed on reconnect
         self._subs: set[tuple[str, str | None, str | None]] = set()
+        self._resume_trades = resume_trades
+        #: the ``since`` the caller subscribed ``trades`` with
+        self._trades_since: str | None = None
+        #: newest ``time`` of the trade frames yielded (resume point)
+        self._last_trade_time: str | None = None
+        #: recently yielded trade keys, oldest first (bounded dedupe window)
+        self._seen_order: deque[Hashable] = deque()
+        self._seen: set[Hashable] = set()
 
     async def _open(self) -> None:
         self._conn = await _ws_connect(
@@ -312,10 +537,19 @@ class AsyncStream:
         *,
         symbol: str | None = None,
         timeframe: Timeframe | str | None = None,
+        since: str | None = None,
     ) -> None:
-        tf = _validate_sub(topic, symbol, timeframe)
+        """Subscribe to ``topic``.
+
+        ``since`` (``trades`` only) first replays the deals at or after that
+        moment. It is **broker server time** as the frames print it (pass a
+        trade frame's ``time``), not UTC, and at most 24 h back.
+        """
+        tf = _validate_sub(topic, symbol, timeframe, since)
+        if topic == "trades":
+            self._trades_since = since
         self._subs.add((topic, symbol, tf))
-        await self._send(_sub_payload(topic, symbol, tf))
+        await self._send(_sub_payload(topic, symbol, tf, since))
 
     async def unsubscribe(
         self,
@@ -325,6 +559,13 @@ class AsyncStream:
         timeframe: Timeframe | str | None = None,
     ) -> None:
         tf = _validate_sub(topic, symbol, timeframe)
+        if topic == "trades":
+            # A later subscribe starts afresh rather than resuming this one,
+            # so a deliberate ``since`` replay is not swallowed by the dedupe.
+            self._trades_since = None
+            self._last_trade_time = None
+            self._seen.clear()
+            self._seen_order.clear()
         self._subs.discard((topic, symbol, tf))
         payload = _sub_payload(topic, symbol, tf)
         payload["action"] = "unsubscribe"
@@ -344,8 +585,12 @@ class AsyncStream:
     async def subscribe_positions(self) -> None:
         await self.subscribe("positions")
 
-    async def subscribe_trades(self) -> None:
-        await self.subscribe("trades")
+    async def subscribe_trades(self, since: str | None = None) -> None:
+        """Subscribe to deals; see :meth:`subscribe` for ``since``."""
+        await self.subscribe("trades", since=since)
+
+    async def subscribe_orders(self) -> None:
+        await self.subscribe("orders")
 
     async def subscribe_terminal(self) -> None:
         await self.subscribe("terminal")
@@ -364,6 +609,9 @@ class AsyncStream:
 
     async def unsubscribe_trades(self) -> None:
         await self.unsubscribe("trades")
+
+    async def unsubscribe_orders(self) -> None:
+        await self.unsubscribe("orders")
 
     async def unsubscribe_terminal(self) -> None:
         await self.unsubscribe("terminal")
@@ -395,8 +643,38 @@ class AsyncStream:
                 msg = json.loads(raw)
             except (ValueError, TypeError):
                 continue
-            if isinstance(msg, dict):
-                yield parse_event(msg)
+            if not isinstance(msg, dict):
+                continue
+            event = parse_event(msg)
+            if isinstance(event, TradeUpdate) and self._resume_trades:
+                if not self._remember_trade(event.data):
+                    continue  # a deal already yielded (replay overlap)
+            yield event
+
+    def _remember_trade(self, data: TradeEventData) -> bool:
+        """Record a trade frame for resume; ``False`` if it is a duplicate."""
+        key = _trade_key(data)
+        if key in self._seen:
+            return False
+        self._seen.add(key)
+        self._seen_order.append(key)
+        if len(self._seen_order) > _DEDUPE_WINDOW:
+            self._seen.discard(self._seen_order.popleft())
+        # The newest time, not the latest frame's: an MT4 remainder's ``In``
+        # can carry its original open time, which must not move the resume
+        # point back (a ``since`` over 24 h old is refused).
+        if data.time and (
+            self._last_trade_time is None
+            or _is_newer(data.time, self._last_trade_time)
+        ):
+            self._last_trade_time = data.time
+        return True
+
+    def _resume_since(self, topic: str) -> str | None:
+        """The ``since`` to resubscribe ``topic`` with after a reconnect."""
+        if topic != "trades" or not self._resume_trades:
+            return None
+        return self._last_trade_time or self._trades_since
 
     async def _reconnect(self) -> bool:
         """Reconnect and replay subscriptions. Returns False if it gave up.
@@ -417,7 +695,9 @@ class AsyncStream:
                 async with self._lock:
                     await self._open()
                     for topic, symbol, tf in list(self._subs):
-                        payload = _sub_payload(topic, symbol, tf)
+                        payload = _sub_payload(
+                            topic, symbol, tf, self._resume_since(topic)
+                        )
                         await self._conn.send(json.dumps(payload))
                 return True
             except (StreamError, ConnectionClosed, OSError):
@@ -495,8 +775,13 @@ class Stream:
         *,
         symbol: str | None = None,
         timeframe: Timeframe | str | None = None,
+        since: str | None = None,
     ) -> None:
-        self._run(self._astream.subscribe(topic, symbol=symbol, timeframe=timeframe))
+        self._run(
+            self._astream.subscribe(
+                topic, symbol=symbol, timeframe=timeframe, since=since
+            )
+        )
 
     def subscribe_prices(self, symbol: str) -> None:
         self._run(self._astream.subscribe_prices(symbol))
@@ -510,8 +795,11 @@ class Stream:
     def subscribe_positions(self) -> None:
         self._run(self._astream.subscribe_positions())
 
-    def subscribe_trades(self) -> None:
-        self._run(self._astream.subscribe_trades())
+    def subscribe_trades(self, since: str | None = None) -> None:
+        self._run(self._astream.subscribe_trades(since))
+
+    def subscribe_orders(self) -> None:
+        self._run(self._astream.subscribe_orders())
 
     def subscribe_terminal(self) -> None:
         self._run(self._astream.subscribe_terminal())
@@ -539,6 +827,9 @@ class Stream:
 
     def unsubscribe_trades(self) -> None:
         self._run(self._astream.unsubscribe_trades())
+
+    def unsubscribe_orders(self) -> None:
+        self._run(self._astream.unsubscribe_orders())
 
     def unsubscribe_terminal(self) -> None:
         self._run(self._astream.unsubscribe_terminal())

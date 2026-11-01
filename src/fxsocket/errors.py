@@ -193,22 +193,60 @@ class ConnectFailedError(FxSocketError):
 class TerminalNotReadyError(FxSocketError):
     """The account's terminal isn't reachable yet.
 
-    Raised on HTTP 503 (trade EA not registered) and when an account has no
-    ``rest_url`` — it is still provisioning, or is bridge-only and exposes no
-    per-account terminal API.
+    Raised on HTTP 503 (trade EA not registered), on ``MRPC_TRADE_EA_STOPPED``
+    (the trade EA stopped before the request was sent, so nothing executed and
+    a retry is safe) and when an account has no ``rest_url`` (it is still
+    provisioning, or is bridge-only and exposes no per-account terminal API).
     """
 
 
 class TerminalTimeoutError(FxSocketError):
-    """The terminal didn't answer in time (HTTP 504 / ``MRPC_TIMEOUT``)."""
+    """The terminal didn't answer in time (HTTP 504).
+
+    Base class for :class:`TradeOutcomeUnknownError` and
+    :class:`TradeAbandonedError`; raised directly for a read that timed out
+    (``MRPC_TIMEOUT``).
+
+    On bridges older than MT5 0.17.0 / MT4 0.15.0 a *trade* that timed out
+    also answers ``MRPC_TIMEOUT``, even when the terminal had already taken
+    the order. On those bridges treat a trade's ``TerminalTimeoutError`` as
+    "may have executed": check :meth:`~fxsocket.TerminalClient.opened_orders`
+    before sending again.
+    """
+
+
+class TradeOutcomeUnknownError(TerminalTimeoutError):
+    """A trade timed out after the terminal took it (HTTP 504
+    ``MRPC_TRADE_OUTCOME_UNKNOWN``). It may have executed.
+
+    Never resend it blindly. Either reconcile through ``opened_orders`` /
+    ``order_history`` (correlate on your own ``magic`` / ``comment``), or, if
+    the order carried a ``client_order_id``, resend it with the same id: the
+    terminal trades nothing a second time and answers with the first
+    outcome.
+    """
+
+
+class TradeAbandonedError(TerminalTimeoutError):
+    """The bridge gave up before the terminal took the command (HTTP 504
+    ``MRPC_ABANDONED``). Nothing was executed, so resending is safe; a
+    ``client_order_id`` it carried is free again."""
+
+
+class ClientOrderIdReusedError(FxSocketError):
+    """The ``client_order_id`` was already used for a different order (HTTP
+    409 ``MRPC_CLIENT_ORDER_ID_REUSED``). Nothing was sent. An id is
+    remembered for 10 minutes; use a fresh one per order."""
 
 
 class UnsupportedOnPlatformError(FxSocketError):
     """A requested feature doesn't exist on the account's platform.
 
-    Nothing raises it at the moment: the MT4 and MT5 terminal APIs accept the
-    same timeframes and order operations. It stays exported for platform gaps
-    that need a client-side guard later.
+    Raised before anything is sent, currently for stop-limit orders on MT4:
+    ``BuyStopLimit`` / ``SellStopLimit`` on ``order_send``, and
+    ``stop_limit_price`` on ``order_modify`` (MT4 has no stop-limit order
+    type; its terminal API rejects the first and would silently ignore the
+    second).
     """
 
 
@@ -252,6 +290,8 @@ def error_from_response(resp: httpx.Response) -> FxSocketError:
         "response": resp,
     }
 
+    if code == "MRPC_TRADE_EA_STOPPED":
+        return TerminalNotReadyError(message, **common)
     if status == 401:
         return AuthError(message, **common)
     if status == 403:
@@ -272,6 +312,8 @@ def error_from_response(resp: httpx.Response) -> FxSocketError:
     if status == 404:
         return NotFoundError(message, **common)
     if status == 409:
+        if code == "MRPC_CLIENT_ORDER_ID_REUSED":
+            return ClientOrderIdReusedError(message, **common)
         if code == "slots_full" and isinstance(body, dict):
             return SlotsFullError(
                 message, used=body.get("used"), cap=body.get("cap"), **common
@@ -310,5 +352,9 @@ def error_from_response(resp: httpx.Response) -> FxSocketError:
     if status == 503:
         return TerminalNotReadyError(message, **common)
     if status == 504:
+        if code == "MRPC_TRADE_OUTCOME_UNKNOWN":
+            return TradeOutcomeUnknownError(message, **common)
+        if code == "MRPC_ABANDONED":
+            return TradeAbandonedError(message, **common)
         return TerminalTimeoutError(message, **common)
     return FxSocketError(message, **common)

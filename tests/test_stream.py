@@ -14,13 +14,20 @@ from fxsocket import (
     AsyncStream,
     Bar,
     DealEntry,
+    ExpirationMode,
+    ModifyUpdate,
+    OrderEventKind,
+    OrdersUpdate,
+    OrderUpdate,
     PositionsUpdate,
+    Replayed,
     Stream,
     StreamWarning,
     Subscribed,
     TerminalUpdate,
     Tick,
     TradeUpdate,
+    ValidationError,
 )
 from fxsocket.terminal.stream import (
     StreamErrorEvent,
@@ -601,3 +608,536 @@ async def test_sync_stream_smoke() -> None:
         await server.wait_closed()
 
     assert any(isinstance(e, Tick) for e in events)
+
+
+# --------------------------------------------------------------------------- #
+# Bridge MT5 0.17.0 / MT4 0.15.0: envelope, new frames, orders, resume
+# --------------------------------------------------------------------------- #
+
+
+def _trade_frame(
+    deal: int,
+    time: str,
+    *,
+    order: int = 0,
+    entry: str = "In",
+    replay: bool = False,
+    seq: int | None = None,
+) -> dict[str, Any]:
+    frame: dict[str, Any] = {
+        "type": "trade",
+        "ts": 1761811200000,
+        "data": {
+            "deal": deal,
+            "order": order or deal,
+            "position": order or deal,
+            "symbol": "EURUSD",
+            "type": "Buy",
+            "entry": entry,
+            "volume": 0.1,
+            "price": 1.0,
+            "profit": 0.0,
+            "commission": 0.0,
+            "swap": 0.0,
+            "magic": 0,
+            "comment": "",
+            "time": time,
+            "degraded": False,
+        },
+    }
+    if replay:
+        frame["replay"] = True
+    if seq is not None:
+        frame["seq"] = seq
+    return frame
+
+
+def test_parse_envelope_and_snapshot() -> None:
+    tick = parse_event({**_TICK, "seq": 41, "ts": 1761811200123})
+    assert isinstance(tick, Tick)
+    assert tick.seq == 41 and tick.ts == 1761811200123 and tick.snapshot is False
+    snap = parse_event({**_TICK, "snapshot": True, "ts": 5})
+    assert isinstance(snap, Tick) and snap.snapshot is True and snap.seq is None
+    # Older bridges send no envelope.
+    old = parse_event(_TICK)
+    assert isinstance(old, Tick) and old.seq is None and old.ts is None
+
+
+def test_parse_trade_new_fields_and_replay_flag() -> None:
+    frame = _trade_frame(9, "2026-10-30T10:00:00.123Z", replay=True)
+    frame["data"].update(
+        {
+            "sl": 1.07,
+            "tp": 1.09,
+            "positionVolume": 0.1,
+            "timeUtc": "2026-10-30T08:00:00.123Z",
+            "remainderTicket": 0,
+            "remainderOf": 0,
+        }
+    )
+    ev = parse_event(frame)
+    assert isinstance(ev, TradeUpdate) and ev.replay is True and ev.seq is None
+    assert ev.data.sl == 1.07 and ev.data.tp == 1.09
+    assert ev.data.position_volume == 0.1
+    assert ev.data.time_utc == "2026-10-30T08:00:00.123Z"
+    # Defaults on bridges before MT5 0.17.0 / MT4 0.15.0.
+    old = parse_event(_trade_frame(9, "t"))
+    assert isinstance(old, TradeUpdate) and old.replay is False
+    assert old.data.position_volume == -1.0 and old.data.time_utc is None
+    assert old.data.sl == 0.0 and old.data.remainder_of == 0
+
+
+def test_parse_mt4_partial_close_links() -> None:
+    out = parse_event(_trade_frame(0, "t", order=100, entry="Out"))
+    assert isinstance(out, TradeUpdate)
+    frame = _trade_frame(0, "t", order=100, entry="Out")
+    frame["data"]["remainderTicket"] = 101
+    out = parse_event(frame)
+    assert isinstance(out, TradeUpdate) and out.data.remainder_ticket == 101
+    frame = _trade_frame(0, "t", order=101, entry="In")
+    frame["data"]["remainderOf"] = 100
+    rem = parse_event(frame)
+    assert isinstance(rem, TradeUpdate) and rem.data.remainder_of == 100
+
+
+def test_parse_modify_order_orders_replayed() -> None:
+    modify = parse_event(
+        {
+            "type": "modify",
+            "seq": 12,
+            "ts": 1,
+            "data": {
+                "position": 100,
+                "symbol": "EURUSD",
+                "type": "Buy",
+                "volume": 0.1,
+                "price": 1.08,
+                "sl": 1.07,
+                "tp": 1.1,
+                "magic": 7,
+                "comment": "",
+                "time": "2026-10-30T10:00:01Z",
+                "timeUtc": "2026-10-30T08:00:01Z",
+            },
+        }
+    )
+    assert isinstance(modify, ModifyUpdate) and modify.seq == 12
+    assert modify.data.position == 100 and modify.data.sl == 1.07
+
+    pending = {
+        "ticket": 555,
+        "symbol": "EURUSD",
+        "type": "BuyLimit",
+        "volumeInitial": 0.2,
+        "volume": 0.2,
+        "price": 1.08,
+        "stopLimitPrice": 0.0,
+        "sl": 0.0,
+        "tp": 0.0,
+        "expirationMode": "gtc",
+        "expiration": "",
+        "expirationUtc": "",
+        "magic": 0,
+        "comment": "",
+        "time": "2026-10-30T10:00:00Z",
+    }
+    order = parse_event(
+        {
+            "type": "order",
+            "seq": 3,
+            "data": {**pending, "event": "triggered", "position": 777},
+        }
+    )
+    assert isinstance(order, OrderUpdate)
+    assert order.data.event == OrderEventKind.TRIGGERED
+    assert order.data.position == 777 and order.data.ticket == 555
+    assert order.data.expiration_mode == ExpirationMode.GTC
+
+    orders = parse_event({"type": "orders", "snapshot": True, "data": [pending]})
+    assert isinstance(orders, OrdersUpdate) and orders.snapshot is True
+    assert orders.data[0].ticket == 555
+
+    done = parse_event(
+        {"type": "replayed", "topic": "trades", "count": 3, "truncated": False}
+    )
+    assert done == Replayed(topic="trades", count=3, truncated=False)
+
+
+def test_parse_warning_names_topic() -> None:
+    w = parse_event(
+        {"topic": "prices", "symbol": "EURUSD", "type": "warning", "dropped": 5}
+    )
+    assert w == StreamWarning(dropped=5, topic="prices", symbol="EURUSD")
+    bars = parse_event(
+        {
+            "topic": "bars",
+            "symbol": "EURUSD",
+            "timeframe": "M5",
+            "type": "warning",
+            "dropped": 1,
+            "ts": 9,
+        }
+    )
+    assert isinstance(bars, StreamWarning) and bars.timeframe == "M5"
+
+
+async def test_since_validation() -> None:
+    s = AsyncStream(ws_url="ws://x/ws", api_key="k", platform="mt5")
+    with pytest.raises(ValidationError, match="trades"):
+        await s.subscribe("prices", symbol="EURUSD", since="2026-10-30T10:00:00Z")
+    with pytest.raises(ValidationError):
+        await s.subscribe_trades(since="")
+    with pytest.raises(ValidationError):
+        await s.subscribe("trades", since=123)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        await s.subscribe("deals")
+
+
+async def test_subscribe_trades_since_and_orders_payloads() -> None:
+    received: list[dict] = []
+
+    async def handler(ws: Any) -> None:
+        try:
+            for _ in range(4):
+                received.append(json.loads(await ws.recv()))
+            await ws.recv()
+        except Exception:
+            pass
+
+    server, url = await _start_server(handler)
+    try:
+        async with AsyncStream(ws_url=url, api_key="k", platform="mt5") as s:
+            await s.subscribe_trades(since="2026-10-30T10:00:00.000Z")
+            await s.subscribe_orders()
+            await s.unsubscribe_orders()
+            await s.subscribe_trades()
+            await asyncio.sleep(0.1)
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert received == [
+        {"action": "subscribe", "topic": "trades", "since": "2026-10-30T10:00:00.000Z"},
+        {"action": "subscribe", "topic": "orders"},
+        {"action": "unsubscribe", "topic": "orders"},
+        {"action": "subscribe", "topic": "trades"},
+    ]
+
+
+def _resume_handler(subs: list[dict]) -> Any:
+    """Conn 1 sends deals 1 and 2, then drops. Conn 2 replays from the
+    resume point (deal 2 again, then 3), reports it, then goes live with
+    deal 3 once more (the switch-over overlap) and deal 4."""
+    conns = {"n": 0}
+
+    async def handler(ws: Any) -> None:
+        conns["n"] += 1
+        n = conns["n"]
+        try:
+            subs.append(json.loads(await ws.recv()))
+            if n == 1:
+                await ws.send(json.dumps(_trade_frame(1, "T1", seq=1)))
+                await ws.send(json.dumps(_trade_frame(2, "T2", seq=2)))
+                await ws.close()
+                return
+            for frame in (
+                _trade_frame(2, "T2", replay=True),
+                _trade_frame(3, "T3", replay=True),
+                {"type": "replayed", "topic": "trades", "count": 2,
+                 "truncated": False},
+                _trade_frame(3, "T3", seq=3),
+                _trade_frame(4, "T4", seq=4),
+            ):
+                await ws.send(json.dumps(frame))
+            await ws.recv()
+        except Exception:
+            pass
+
+    return handler
+
+
+async def _collect_deals(url: str, *, resume_trades: bool) -> list[Any]:
+    got: list[Any] = []
+    async with AsyncStream(
+        ws_url=url,
+        api_key="k",
+        platform="mt5",
+        auto_reconnect=True,
+        max_reconnect_attempts=3,
+        resume_trades=resume_trades,
+    ) as s:
+        await s.subscribe_trades()
+
+        async def consume() -> None:
+            async for ev in s:
+                got.append(ev)
+                if isinstance(ev, TradeUpdate) and ev.data.deal == 4:
+                    return
+
+        await asyncio.wait_for(consume(), timeout=5)
+    return got
+
+
+async def test_resume_trades_after_reconnect_dedupes() -> None:
+    subs: list[dict] = []
+    server, url = await _start_server(_resume_handler(subs))
+    try:
+        got = await _collect_deals(url, resume_trades=True)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert subs == [
+        {"action": "subscribe", "topic": "trades"},
+        {"action": "subscribe", "topic": "trades", "since": "T2"},
+    ]
+    deals = [e.data.deal for e in got if isinstance(e, TradeUpdate)]
+    assert deals == [1, 2, 3, 4]  # the replayed 2 and the live 3 were dropped
+    replayed_3 = next(
+        e for e in got if isinstance(e, TradeUpdate) and e.data.deal == 3
+    )
+    assert replayed_3.replay is True
+    assert any(isinstance(e, Replayed) and e.count == 2 for e in got)
+
+
+async def test_resume_trades_off_keeps_old_behavior() -> None:
+    subs: list[dict] = []
+    server, url = await _start_server(_resume_handler(subs))
+    try:
+        got = await _collect_deals(url, resume_trades=False)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    # Plain resubscribe, every frame passed through.
+    assert subs == [
+        {"action": "subscribe", "topic": "trades"},
+        {"action": "subscribe", "topic": "trades"},
+    ]
+    deals = [e.data.deal for e in got if isinstance(e, TradeUpdate)]
+    assert deals == [1, 2, 2, 3, 3, 4]
+
+
+async def test_resume_uses_callers_since_until_a_frame_arrives() -> None:
+    subs: list[dict] = []
+    conns = {"n": 0}
+
+    async def handler(ws: Any) -> None:
+        conns["n"] += 1
+        try:
+            subs.append(json.loads(await ws.recv()))
+            if conns["n"] == 1:
+                await ws.close()  # drop before any trade frame
+                return
+            await ws.send(json.dumps(_trade_frame(5, "T5", seq=1)))
+            await ws.recv()
+        except Exception:
+            pass
+
+    server, url = await _start_server(handler)
+    try:
+        async with AsyncStream(
+            ws_url=url, api_key="k", platform="mt5", max_reconnect_attempts=3
+        ) as s:
+            await s.subscribe_trades(since="T0")
+
+            async def consume() -> None:
+                async for ev in s:
+                    if isinstance(ev, TradeUpdate):
+                        return
+
+            await asyncio.wait_for(consume(), timeout=5)
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert [sub.get("since") for sub in subs] == ["T0", "T0"]
+
+
+def test_trade_dedupe_keys_and_window() -> None:
+    from fxsocket.models import TradeEventData
+    from fxsocket.terminal.stream import _DEDUPE_WINDOW
+
+    def data(deal: int, order: int, entry: str, time: str = "t") -> TradeEventData:
+        return TradeEventData.model_validate(
+            _trade_frame(deal, time, order=order, entry=entry)["data"]
+        )
+
+    s = AsyncStream(ws_url="ws://x/ws", api_key="k", platform="mt4")
+    # MT4: deal is 0, so order + entry identify the frame.
+    assert s._remember_trade(data(0, 100, "In", "A")) is True
+    assert s._remember_trade(data(0, 100, "Out", "B")) is True
+    assert s._remember_trade(data(0, 100, "In", "C")) is False
+    assert s._last_trade_time == "B"  # duplicates don't move the resume point
+    # The window is bounded: the oldest key is forgotten once it overflows.
+    for i in range(_DEDUPE_WINDOW):
+        s._remember_trade(data(i + 1, i + 1, "In"))
+    assert len(s._seen) == _DEDUPE_WINDOW
+    assert s._remember_trade(data(0, 100, "In")) is True
+
+
+def test_resume_point_is_the_newest_trade_time() -> None:
+    from fxsocket.models import TradeEventData
+
+    def data(order: int, entry: str, time: str) -> TradeEventData:
+        return TradeEventData.model_validate(
+            _trade_frame(0, time, order=order, entry=entry)["data"]
+        )
+
+    s = AsyncStream(ws_url="ws://x/ws", api_key="k", platform="mt4")
+    s._remember_trade(data(100, "Out", "2026-10-30T10:00:05.250Z"))
+    # An MT4 remainder's In carries the original open time: older, so the
+    # resume point must stay on the Out.
+    s._remember_trade(data(101, "In", "2026-10-29T08:00:00.000Z"))
+    assert s._last_trade_time == "2026-10-30T10:00:05.250Z"
+    # Same second without and with milliseconds still orders by time.
+    s._remember_trade(data(102, "In", "2026-10-30T10:00:05Z"))
+    assert s._last_trade_time == "2026-10-30T10:00:05.250Z"
+    s._remember_trade(data(103, "In", "2026-10-30T10:00:06Z"))
+    assert s._last_trade_time == "2026-10-30T10:00:06Z"
+
+
+async def test_unsubscribe_trades_resets_resume_state() -> None:
+    from fxsocket.models import TradeEventData
+
+    s = AsyncStream(ws_url="ws://x/ws", api_key="k", platform="mt5")
+    sent: list[dict] = []
+
+    async def fake_send(payload: dict) -> None:
+        sent.append(payload)
+
+    s._send = fake_send  # type: ignore[method-assign]
+    await s.subscribe_trades(since="2026-10-30T09:00:00Z")
+    frame = TradeEventData.model_validate(
+        _trade_frame(7, "2026-10-30T10:00:00Z")["data"]
+    )
+    assert s._remember_trade(frame) is True
+    await s.unsubscribe_trades()
+    assert s._last_trade_time is None
+    assert s._trades_since is None
+    # A deliberate replay after a fresh subscribe is not swallowed.
+    await s.subscribe_trades(since="2026-10-30T09:00:00Z")
+    assert s._remember_trade(frame) is True
+    assert sent[-1] == {
+        "action": "subscribe",
+        "topic": "trades",
+        "since": "2026-10-30T09:00:00Z",
+    }
+
+
+async def test_modify_frames_are_never_deduped() -> None:
+    modify = {
+        "type": "modify",
+        "data": {
+            "position": 1,
+            "symbol": "EURUSD",
+            "type": "Buy",
+            "volume": 0.1,
+            "price": 1.0,
+            "sl": 0.9,
+            "tp": 0.0,
+            "magic": 0,
+            "comment": "",
+            "time": "T1",
+        },
+    }
+
+    async def handler(ws: Any) -> None:
+        try:
+            await ws.recv()
+            for frame in (modify, modify, _trade_frame(1, "T1"), _trade_frame(1, "T1")):
+                await ws.send(json.dumps(frame))
+            await ws.send(json.dumps(_TICK))
+            await ws.recv()
+        except Exception:
+            pass
+
+    server, url = await _start_server(handler)
+    got: list[Any] = []
+    try:
+        async with AsyncStream(ws_url=url, api_key="k", platform="mt5") as s:
+            await s.subscribe_trades()
+
+            async def consume() -> None:
+                async for ev in s:
+                    got.append(ev)
+                    if isinstance(ev, Tick):
+                        return
+
+            await asyncio.wait_for(consume(), timeout=5)
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert sum(isinstance(e, ModifyUpdate) for e in got) == 2
+    assert sum(isinstance(e, TradeUpdate) for e in got) == 1
+
+
+def test_client_stream_factories_pass_resume_trades() -> None:
+    from fxsocket import AsyncClient, Client
+    from fxsocket.models import Account
+
+    account = Account.model_validate(
+        {
+            "id": "acc-1",
+            "platform": "mt5",
+            "server": "Demo",
+            "login": 1,
+            "status": "connected",
+            "rest_url": "https://term.test",
+            "ws_url": "wss://term.test/ws",
+            "created_at": "2026-06-22T16:53:56Z",
+        }
+    )
+    with Client(api_key="fxs_live_k") as fx:
+        s = fx.stream(account, resume_trades=False)
+        try:
+            assert s._astream._resume_trades is False
+        finally:
+            s.close()
+        s = fx.stream(account)
+        try:
+            assert s._astream._resume_trades is True
+        finally:
+            s.close()
+    afx = AsyncClient(api_key="fxs_live_k")
+    assert afx.stream(account, resume_trades=False)._resume_trades is False
+
+
+async def test_sync_stream_trades_since_and_orders() -> None:
+    received: list[dict] = []
+
+    async def handler(ws: Any) -> None:
+        try:
+            for _ in range(2):
+                received.append(json.loads(await ws.recv()))
+            await ws.send(json.dumps(_trade_frame(1, "T1", seq=1)))
+            await ws.recv()
+        except Exception:
+            pass
+
+    server, url = await _start_server(handler)
+
+    def run_sync() -> list[Any]:
+        def factory() -> AsyncStream:
+            return AsyncStream(
+                ws_url=url, api_key="k", platform="mt5", auto_reconnect=False
+            )
+
+        out: list[Any] = []
+        with Stream(factory) as s:
+            s.subscribe_trades(since="T0")
+            s.subscribe_orders()
+            for ev in s:
+                out.append(ev)
+                if isinstance(ev, TradeUpdate):
+                    break
+        return out
+
+    try:
+        events = await asyncio.get_running_loop().run_in_executor(None, run_sync)
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert received == [
+        {"action": "subscribe", "topic": "trades", "since": "T0"},
+        {"action": "subscribe", "topic": "orders"},
+    ]
+    assert any(isinstance(e, TradeUpdate) for e in events)

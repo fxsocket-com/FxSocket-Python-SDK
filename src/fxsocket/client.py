@@ -124,12 +124,14 @@ class Client:
         *,
         verify: bool | None = None,
         auto_reconnect: bool = True,
+        resume_trades: bool = True,
     ) -> Stream:
         """Open a synchronous WebSocket stream for ``account``.
 
         Returns a context-managed :class:`~fxsocket.Stream`; use it as
         ``with client.stream(account) as s:`` and iterate it. Raises
         :class:`TerminalNotReadyError` if the account has no WS endpoint yet.
+        ``resume_trades`` is explained on :class:`~fxsocket.AsyncStream`.
         """
         if not account.ws_url:
             raise TerminalNotReadyError(
@@ -148,6 +150,7 @@ class Client:
                 platform=platform,
                 verify=verify_tls,
                 auto_reconnect=auto_reconnect,
+                resume_trades=resume_trades,
             )
 
         return Stream(factory)
@@ -240,12 +243,14 @@ class AsyncClient:
         *,
         verify: bool | None = None,
         auto_reconnect: bool = True,
+        resume_trades: bool = True,
     ) -> AsyncStream:
         """Open an async WebSocket stream for ``account``.
 
         Returns an :class:`~fxsocket.AsyncStream`; use it as
         ``async with client.stream(account) as s:`` and iterate it. Raises
         :class:`TerminalNotReadyError` if the account has no WS endpoint yet.
+        ``resume_trades`` is explained on :class:`~fxsocket.AsyncStream`.
         """
         if not account.ws_url:
             raise TerminalNotReadyError(
@@ -258,6 +263,7 @@ class AsyncClient:
             platform=account.platform,
             verify=self.verify_terminal_tls if verify is None else verify,
             auto_reconnect=auto_reconnect,
+            resume_trades=resume_trades,
         )
 
     async def aclose(self) -> None:

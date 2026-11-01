@@ -5,6 +5,70 @@ All notable changes to this project are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Releases
 up to 0.7.0 are described in their tagged commits.
 
+## [0.9.0] - 2026-11-01
+
+Support for terminal bridges MT5 0.17.0 / MT4 0.15.0. Everything new is
+additive: on older bridges the new fields keep their defaults, the new
+endpoints are not served and `since` is ignored.
+
+### Added
+
+- `pending_orders()` with the new `PendingOrder` model (initial volume,
+  stop-limit price, `expiration_mode`, `expiration`, `expiration_utc`).
+- `symbol_select(symbols)` puts up to 100 symbols into Market Watch in one
+  pass (`SymbolSelectResult`); `symbol_infos(symbols)` fetches up to 100
+  specs at once (`SymbolInfoBatch` with per-symbol `errors`).
+- `SymbolInfo.order_modes`, `expiration_modes` and `filling_modes`.
+- `order_send(client_order_id=...)`: the terminal trades an id once and
+  answers repeats with the first outcome, so a retry is safe.
+  `OrderResult.idempotent_replayed` reports a replayed answer.
+- `order_send(expiration_utc=...)` and `order_modify(expiration_utc=...)`
+  set a pending order's expiry in UTC instead of broker server time.
+- `OrderResult.position`, `time`, `time_utc`, `remainder_ticket`,
+  `client_order_id` and `server_timing` (`ServerTiming`, from the
+  `Server-Timing` header).
+- Errors: `TradeOutcomeUnknownError` and `TradeAbandonedError` (both
+  subclasses of `TerminalTimeoutError`) and `ClientOrderIdReusedError`.
+  `TerminalErrorCode` lists the terminal's fixed error codes.
+- Streaming: the `orders` topic (`subscribe_orders()`, `OrdersUpdate`
+  snapshot, `OrderUpdate` per step with `OrderEventKind`), `modify` frames on
+  `trades` (`ModifyUpdate`), `subscribe_trades(since=...)` with the
+  `Replayed` event, and the frame envelope (`seq`, `ts`, `snapshot`, plus
+  `replay` on `TradeUpdate`) on every data event.
+- `TradeEventData.sl`, `tp`, `position_volume`, `time_utc` and, for MT4
+  partial closes, `remainder_ticket` / `remainder_of`.
+- `StreamWarning.topic`, `symbol` and `timeframe` name the stream that lost
+  frames.
+- `BridgeHealth` trade-pipeline fields from `/status` (`async_trades`,
+  `trade_in_flight`, `oldest_trade_in_flight_age_ms`, `dealer_rtt_ms_ewma`,
+  `trade_requests_sent`, `late_trade_verdicts`, `trade_queue_depth`,
+  `non_trade_queue_depth`, `trade_deferred`).
+- `ExpirationMode`, `OrderEventKind` and `DealEntry.OUT_BY`.
+
+### Changed
+
+- Trades resume after a reconnect. With `resume_trades=True` (the new
+  default on `fx.stream(...)` and `AsyncStream`) the stream resubscribes
+  `trades` from the newest deal `time` it delivered, so deals executed while the
+  connection was down are replayed, and deals seen twice are dropped. Pass
+  `resume_trades=False` for the previous behavior.
+- A 504 is now split by code: `TradeOutcomeUnknownError` (the trade may have
+  executed), `TradeAbandonedError` (it did not) or a plain
+  `TerminalTimeoutError` (a read timed out). Existing
+  `except TerminalTimeoutError` handlers still catch all three.
+- `MRPC_TRADE_EA_STOPPED` raises `TerminalNotReadyError` (nothing executed).
+- A 409 `MRPC_CLIENT_ORDER_ID_REUSED` raises `ClientOrderIdReusedError`
+  instead of falling through to `DuplicateAccountError`.
+- On these bridges an unknown symbol is HTTP 400 `MRPC_UNKNOWN_SYMBOL` and so
+  raises `ValidationError` (it used to be a 500 and a plain `FxSocketError`).
+
+### Fixed
+
+- Stop-limit orders on MT4 now raise `UnsupportedOnPlatformError` before
+  anything is sent. The SDK used to claim MT4 accepts them, but the MT4
+  terminal API rejects `BuyStopLimit` / `SellStopLimit` with HTTP 400 and
+  silently ignores `stop_limit_price` on `order_modify`.
+
 ## [0.8.0] - 2026-10-26
 
 ### Removed
@@ -36,4 +100,5 @@ up to 0.7.0 are described in their tagged commits.
 - `fxsocket.enums.MT5_ONLY_TIMEFRAMES` is always empty and will be removed in
   1.0.
 
+[0.9.0]: https://github.com/fxsocket-com/FxSocket-Python-SDK/releases/tag/v0.9.0
 [0.8.0]: https://github.com/fxsocket-com/FxSocket-Python-SDK/releases/tag/v0.8.0
