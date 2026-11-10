@@ -7,6 +7,11 @@ up to 0.7.0 are described in their tagged commits.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-10
+
+cTrader support. cTrader accounts speak the same terminal API as MT5, so
+everything else works on them unchanged.
+
 ### Added
 
 - `Platform.CTRADER`: cTrader accounts (linked from the dashboard) are
@@ -117,5 +122,6 @@ endpoints are not served and `since` is ignored.
 - `fxsocket.enums.MT5_ONLY_TIMEFRAMES` is always empty and will be removed in
   1.0.
 
+[0.10.0]: https://github.com/fxsocket-com/FxSocket-Python-SDK/releases/tag/v0.10.0
 [0.9.0]: https://github.com/fxsocket-com/FxSocket-Python-SDK/releases/tag/v0.9.0
 [0.8.0]: https://github.com/fxsocket-com/FxSocket-Python-SDK/releases/tag/v0.8.0
