@@ -12,7 +12,8 @@ interfaces.
 
 ## Features
 
-- **Account management** — link, list, fetch, and disconnect MT4/MT5 accounts.
+- **Account management** — link, list, fetch, and disconnect MT4/MT5 accounts;
+  list and disconnect cTrader accounts (those are linked from the dashboard).
 - **Private servers** — list your dedicated hosting servers and manage the
   accounts on them.
 - **Read-only keys** — mint, scope, rotate and revoke `fxs_ro_…` keys for
@@ -29,7 +30,7 @@ interfaces.
   and missed deals replayed after a reconnect.
 - **Sync *and* async** — `Client` / `AsyncClient`, method-for-method mirrors.
 - **Typed** — Pydantic v2 models throughout; ships `py.typed`.
-- **One interface for MT4 and MT5** — platform differences handled for you.
+- **One interface for MT4, MT5 and cTrader** — platform differences handled for you.
 
 ## Install
 
@@ -286,15 +287,21 @@ in `order_modify`, a literal `stop_loss=0.0` would *remove* your stop-loss, so
 it's rejected — pass `clear_stop_loss=True` to remove one deliberately, while
 `None` (the default) keeps the current value.
 
-MT4 and MT5 share one interface, timeframes included. Both accept the same nine:
+MT4, MT5 and cTrader share one interface, timeframes included. All accept the same nine:
 `M1`, `M5`, `M15`, `M30`, `H1`, `H4`, `D1`, `W1`, `MN1` (or `1min`, `5min`,
 `15min`, `30min`, `1h`, `4h`, `1d`, `1w`, `1month`). MT5's other periods, such
 as `H2` or `H12`, aren't served by the terminal API, so anything else raises
 `ValidationError` before any request.
 
-The one platform gate is stop-limit: MT4 has no stop-limit order type, so
-`BuyStopLimit` / `SellStopLimit` (and `stop_limit_price` on `order_modify`)
-raise `UnsupportedOnPlatformError` on MT4 before anything is sent.
+The one platform gate is stop-limit: MT4 has no stop-limit order type, and
+cTrader's fills within a range beyond the stop instead of resting as a limit,
+so `BuyStopLimit` / `SellStopLimit` (and `stop_limit_price` on `order_modify`)
+raise `UnsupportedOnPlatformError` on MT4 and cTrader before anything is sent.
+
+cTrader accounts are linked from the FxSocket dashboard with a cTrader ID
+sign-in, so `accounts.create(platform="ctrader")` raises `ValidationError`.
+Once linked, a cTrader account is listed, traded and streamed like any other:
+its `rest_url` is `https://api.fxsocket.com/ctrader/<account id>`.
 
 > **MT4 history note:** on MT4, `price_history` with `from_`/`to` bounds (or the
 > `D1` timeframe) can fail server-side with `CopyRates failed` when the terminal

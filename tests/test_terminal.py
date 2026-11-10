@@ -344,6 +344,36 @@ def test_order_send_stop_limit_unsupported_on_mt4(op: str) -> None:
 
 
 @respx.mock
+@pytest.mark.parametrize("op", ["BuyStopLimit", "SellStopLimit"])
+def test_order_send_stop_limit_unsupported_on_ctrader(op: str) -> None:
+    # cTrader's stop-limit is a different order; the bridge refuses it.
+    route = respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK),
+    )
+    with _term(platform="ctrader") as t, pytest.raises(
+        UnsupportedOnPlatformError, match="cTrader"
+    ):
+        t.order_send(
+            symbol="EURUSD",
+            operation=op,
+            volume=0.1,
+            price=1.1,
+            stop_limit_price=1.09,
+        )
+    assert not route.called
+
+
+@respx.mock
+def test_order_modify_stop_limit_price_unsupported_on_ctrader() -> None:
+    route = respx.post(f"{TERM}/OrderModify").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK),
+    )
+    with _term(platform="ctrader") as t, pytest.raises(UnsupportedOnPlatformError):
+        t.order_modify(100, stop_limit_price=1.09)
+    assert not route.called
+
+
+@respx.mock
 def test_order_send_stop_limit_allowed_on_mt5() -> None:
     route = respx.post(f"{TERM}/OrderSend").mock(
         return_value=httpx.Response(200, json=_ORDER_OK),

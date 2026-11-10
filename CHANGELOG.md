@@ -5,6 +5,23 @@ All notable changes to this project are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Releases
 up to 0.7.0 are described in their tagged commits.
 
+## [Unreleased]
+
+### Added
+
+- `Platform.CTRADER`: cTrader accounts (linked from the dashboard) are
+  listed, fetched, traded and streamed like MT4 and MT5 accounts. Before
+  this, `accounts.list()` failed to parse an account with
+  `platform: "ctrader"`.
+
+### Changed
+
+- `BuyStopLimit` / `SellStopLimit` and `stop_limit_price` raise
+  `UnsupportedOnPlatformError` on cTrader too, before sending.
+- `accounts.create()` and `private_servers.add_account()` raise
+  `ValidationError` for `platform="ctrader"`: cTrader accounts are linked
+  from the dashboard.
+
 ## [0.9.0] - 2026-11-01
 
 Support for terminal bridges MT5 0.17.0 / MT4 0.15.0. Everything new is

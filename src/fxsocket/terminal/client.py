@@ -248,22 +248,36 @@ def _check_symbols(symbols: Sequence[str]) -> list[str]:
     return names
 
 
+#: Why a platform has no MT5-style stop-limit order.
+_NO_STOP_LIMIT = {
+    Platform.MT4: "MT4 has no stop-limit order type",
+    Platform.CTRADER: (
+        "cTrader's stop-limit fills within a range beyond the stop instead "
+        "of resting as a limit"
+    ),
+}
+
+
 def _guard_stop_limit_send(platform: Platform, op: OrderOperation) -> None:
-    if platform is Platform.MT4 and op in STOP_LIMIT_OPERATIONS:
+    reason = _NO_STOP_LIMIT.get(platform)
+    if reason and op in STOP_LIMIT_OPERATIONS:
         raise UnsupportedOnPlatformError(
-            f"{op.value} orders are not supported on MT4 (MT4 has no "
-            "stop-limit order type)"
+            f"{op.value} orders are not supported on {_label(platform)} ({reason})"
         )
 
 
 def _guard_stop_limit_modify(
     platform: Platform, stop_limit_price: float | None
 ) -> None:
-    if platform is Platform.MT4 and stop_limit_price is not None:
+    reason = _NO_STOP_LIMIT.get(platform)
+    if reason and stop_limit_price is not None:
         raise UnsupportedOnPlatformError(
-            "stop_limit_price is not supported on MT4 (MT4 has no stop-limit "
-            "order type)"
+            f"stop_limit_price is not supported on {_label(platform)} ({reason})"
         )
+
+
+def _label(platform: Platform) -> str:
+    return "cTrader" if platform is Platform.CTRADER else platform.value.upper()
 
 
 def _order_result(body: Any, headers: Any) -> OrderResult:

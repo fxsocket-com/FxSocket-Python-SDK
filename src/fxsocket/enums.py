@@ -10,10 +10,17 @@ from enum import Enum
 
 
 class Platform(str, Enum):
-    """Trading platform of a linked account."""
+    """Trading platform of a linked account.
+
+    cTrader accounts are linked from the dashboard (a cTrader ID sign-in,
+    no password), not through :meth:`~fxsocket.Client.accounts`
+    ``.create``; once linked they are listed, traded and streamed like
+    MT4 and MT5 accounts.
+    """
 
     MT4 = "mt4"
     MT5 = "mt5"
+    CTRADER = "ctrader"
 
 
 class TradingStatus(str, Enum):
@@ -28,10 +35,11 @@ class TradingStatus(str, Enum):
 class OrderOperation(str, Enum):
     """Order operation accepted by the terminal ``/OrderSend``.
 
-    MT5 accepts all eight. MT4 has no stop-limit order type: its terminal
-    API rejects ``BuyStopLimit``/``SellStopLimit`` (HTTP 400
-    ``MRPC_UNSUPPORTED``), so the SDK raises
-    :class:`~fxsocket.UnsupportedOnPlatformError` for them on MT4 before
+    MT5 accepts all eight. MT4 has no stop-limit order type, and cTrader's
+    differs from MT5's (it fills within a range beyond the stop instead of
+    resting as a limit), so both terminal APIs reject
+    ``BuyStopLimit``/``SellStopLimit`` and the SDK raises
+    :class:`~fxsocket.UnsupportedOnPlatformError` for them there before
     anything is sent.
     """
 

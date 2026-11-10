@@ -29,6 +29,19 @@ def account_id_of(account: Account | str) -> str:
     return account.id if isinstance(account, Account) else str(account)
 
 
+def _password_platform(platform: Platform | str) -> str:
+    """The platform of a password link. cTrader has none: its accounts are
+    linked from the dashboard with a cTrader ID sign-in, and the API
+    refuses them (HTTP 400), so the SDK says so before sending."""
+    value = Platform(platform)
+    if value is Platform.CTRADER:
+        raise ValidationError(
+            "cTrader accounts are linked from the FxSocket dashboard (sign in "
+            "with cTrader), not through the API"
+        )
+    return value.value
+
+
 def _create_payload(
     *,
     server: str,
@@ -43,7 +56,7 @@ def _create_payload(
     proxy_local_port: int | None,
 ) -> dict[str, object]:
     body: dict[str, object] = {
-        "platform": Platform(platform).value,
+        "platform": _password_platform(platform),
         "server": server,
         "login": login,
         "password": password,
@@ -241,7 +254,7 @@ def _private_account_payload(
     trade_ea_symbol: str,
 ) -> dict[str, object]:
     return {
-        "platform": Platform(platform).value,
+        "platform": _password_platform(platform),
         "server": server,
         "login": login,
         "password": password,

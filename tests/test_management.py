@@ -90,6 +90,42 @@ def test_list_accounts_parses_models() -> None:
     assert pod.trade_ea_symbol == ""
 
 
+CTRADER_ACCOUNT = {
+    "id": "734b09e7-1e8b-4606-8df5-7629b16e5cb6",
+    "nickname": "",
+    "platform": "ctrader",
+    "server": "Spotware (demo)",
+    "login": 5958067,
+    "status": "connected",
+    "error": "",
+    "rest_url": "https://api.fxsocket.com/ctrader/734b09e7-1e8b-4606-8df5-7629b16e5cb6",
+    "ws_url": "wss://api.fxsocket.com/ctrader/734b09e7-1e8b-4606-8df5-7629b16e5cb6/ws",
+    "created_at": "2026-11-10T13:29:10Z",
+}
+
+
+@respx.mock
+def test_list_accounts_parses_a_ctrader_account() -> None:
+    respx.get(f"{BASE}/accounts").mock(
+        return_value=httpx.Response(200, json=[POD_ACCOUNT, CTRADER_ACCOUNT])
+    )
+    with _client() as fx:
+        accounts = fx.accounts.list()
+
+    assert [a.platform for a in accounts] == [Platform.MT5, Platform.CTRADER]
+    assert accounts[1].has_terminal is True
+
+
+@respx.mock
+def test_create_refuses_ctrader_before_sending() -> None:
+    route = respx.post(f"{BASE}/accounts").mock(
+        return_value=httpx.Response(201, json=CTRADER_ACCOUNT)
+    )
+    with _client() as fx, pytest.raises(ValidationError, match="dashboard"):
+        fx.accounts.create(server="x", login=1, password="pw", platform="ctrader")
+    assert not route.called
+
+
 @respx.mock
 def test_get_account_sends_api_key_header() -> None:
     route = respx.get(f"{BASE}/accounts/{POD_ACCOUNT['id']}").mock(
