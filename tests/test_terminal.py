@@ -1467,3 +1467,200 @@ async def test_async_mt4_stop_limit_guard() -> None:
             await term.order_modify(1, stop_limit_price=1.1)
     finally:
         await term.aclose()
+
+
+# -- bridges MT5 0.18.x / MT4 0.16.x ----------------------------------------- #
+
+
+@respx.mock
+def test_history_rows_carry_sl_tp() -> None:
+    respx.get(f"{TERM}/OrderHistory").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "ticket": 2,
+                    "order": 1,
+                    "position": 1,
+                    "symbol": "EURUSD",
+                    "type": "Sell",
+                    "entry": "Out",
+                    "volume": 0.01,
+                    "price": 1.1,
+                    "profit": 1.0,
+                    "commission": 0.0,
+                    "swap": 0.0,
+                    "magic": 0,
+                    "comment": "",
+                    "time": "2026-11-20T10:00:00.000Z",
+                    "sl": 1.095,
+                    "tp": 1.11,
+                }
+            ],
+        )
+    )
+    respx.get(f"{TERM}/PositionHistory").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "positionId": 1,
+                    "symbol": "EURUSD",
+                    "type": "Buy",
+                    "volume": 0.01,
+                    "openTime": "2026-11-20T09:00:00Z",
+                    "openPrice": 1.09,
+                    "closeTime": "2026-11-20T10:00:00Z",
+                    "closePrice": 1.1,
+                    "profit": 1.0,
+                    "swap": 0.0,
+                    "commission": 0.0,
+                    "netProfit": 1.0,
+                    "magic": 0,
+                    "comment": "",
+                    "sl": 1.085,
+                    "tp": 1.1,
+                }
+            ],
+        )
+    )
+    with _term() as t:
+        deal = t.order_history()[0]
+        pos = t.position_history()[0]
+    assert (deal.sl, deal.tp) == (1.095, 1.11)
+    assert (pos.sl, pos.tp) == (1.085, 1.1)
+
+
+def test_history_rows_default_sl_tp_on_older_bridges() -> None:
+    from fxsocket.models import PositionTrade
+
+    row = PositionTrade.model_validate(
+        {
+            "positionId": 1,
+            "symbol": "EURUSD",
+            "type": "Buy",
+            "volume": 0.01,
+            "openTime": "",
+            "openPrice": 1.0,
+            "closeTime": "",
+            "closePrice": 1.0,
+            "profit": 0.0,
+            "swap": 0.0,
+            "commission": 0.0,
+            "netProfit": 0.0,
+            "magic": 0,
+            "comment": "",
+        }
+    )
+    assert row.sl == 0.0 and row.tp == 0.0
+
+
+def test_status_auth_error() -> None:
+    from fxsocket.models import AccountHealth
+
+    refused = AccountHealth.model_validate(
+        {"loggedIn": False, "login": 7, "authError": "Invalid account"}
+    )
+    assert refused.auth_error == "Invalid account"
+    assert AccountHealth.model_validate({"loggedIn": True}).auth_error == ""
+
+
+@respx.mock
+def test_order_close_pending_only() -> None:
+    route = respx.post(f"{TERM}/OrderClose").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    with _term() as t:
+        t.order_close(100, pending_only=True)
+        assert json.loads(route.calls.last.request.content) == {
+            "ticket": 100,
+            "pendingOnly": True,
+        }
+        t.order_close(100)
+        assert "pendingOnly" not in json.loads(route.calls.last.request.content)
+
+
+@respx.mock
+def test_order_close_not_pending_maps_to_typed_error() -> None:
+    from fxsocket import NotPendingError
+
+    respx.post(f"{TERM}/OrderClose").mock(
+        return_value=httpx.Response(
+            409, json={"error": "MRPC_NOT_PENDING", "message": "ticket is a position"}
+        )
+    )
+    with _term() as t, pytest.raises(NotPendingError):
+        t.order_close(100, pending_only=True)
+
+
+@respx.mock
+def test_order_send_manual_execution() -> None:
+    route = respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    with _term(platform="mt4") as t:
+        t.order_send(
+            symbol="EURUSD",
+            operation="Buy",
+            volume=0.01,
+            stop_loss=1.0,
+            execution="manual",
+        )
+    body = json.loads(route.calls.last.request.content)
+    assert body["execution"] == "Manual" and body["stopLoss"] == 1.0
+    assert "expertId" not in body
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"operation": "BuyLimit", "price": 1.0},
+        {"operation": "Buy", "magic": 7},
+        {"operation": "Buy", "expiration": "2026-12-01T00:00:00"},
+    ],
+)
+def test_order_send_manual_validated_before_sending(kwargs: dict) -> None:
+    with _term() as t, pytest.raises(ValidationError):
+        t.order_send(symbol="EURUSD", volume=0.01, execution="Manual", **kwargs)
+
+
+def test_order_send_manual_unsupported_on_ctrader() -> None:
+    with _term(platform="ctrader") as t, pytest.raises(UnsupportedOnPlatformError):
+        t.order_send(symbol="EURUSD", operation="Buy", volume=0.01, execution="Manual")
+
+
+def test_order_send_unknown_execution() -> None:
+    with _term() as t, pytest.raises(ValidationError):
+        t.order_send(symbol="EURUSD", operation="Buy", volume=0.01, execution="Bot")
+
+
+@respx.mock
+def test_order_send_manual_not_sent_maps_to_typed_error() -> None:
+    from fxsocket import ManualNotSentError
+
+    respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(
+            500, json={"error": "MRPC_MANUAL_NOT_SENT", "message": "volume mismatch"}
+        )
+    )
+    with _term() as t, pytest.raises(ManualNotSentError):
+        t.order_send(symbol="EURUSD", operation="Sell", volume=0.01, execution="Manual")
+
+
+@respx.mock
+async def test_async_pending_only_and_manual() -> None:
+    close = respx.post(f"{TERM}/OrderClose").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    send = respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    async with AsyncTerminalClient(
+        base_url=TERM, api_key="fxs_live_k", platform="mt5"
+    ) as t:
+        await t.order_close(5, pending_only=True)
+        await t.order_send(
+            symbol="EURUSD", operation="Sell", volume=0.01, execution="Manual"
+        )
+    assert json.loads(close.calls.last.request.content)["pendingOnly"] is True
+    assert json.loads(send.calls.last.request.content)["execution"] == "Manual"

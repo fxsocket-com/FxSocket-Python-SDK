@@ -71,6 +71,22 @@ PENDING_OPERATIONS = frozenset(
 )
 
 
+class Execution(str, Enum):
+    """How ``order_send`` places an order (the ``execution`` field).
+
+    ``EA`` (the default) is the normal path. ``MANUAL`` goes through the
+    account's own order dialog, so the broker records a manual order: for
+    brokers that refuse expert trading (``AccountInfo.trade_expert`` is
+    ``False``, every order fails with retcode 10026). Manual orders are
+    market orders only (``Buy`` / ``Sell``, optional SL/TP and comment), have
+    magic 0 and take 1-3 s. Needs bridge MT5 0.18.0 / MT4 0.16.0; not on
+    cTrader.
+    """
+
+    EA = "EA"
+    MANUAL = "Manual"
+
+
 class OrderOutcome(str, Enum):
     """Semantic classification of a trade result (``OrderResult.outcome``).
 
@@ -272,6 +288,10 @@ class TerminalErrorCode(str, Enum):
     MRPC_TICKET_BUSY = "MRPC_TICKET_BUSY"
     #: 409, ``client_order_id`` already used for a different order
     MRPC_CLIENT_ORDER_ID_REUSED = "MRPC_CLIENT_ORDER_ID_REUSED"
+    #: 409, ``pending_only`` close, but the ticket is a position by now
+    MRPC_NOT_PENDING = "MRPC_NOT_PENDING"
+    #: 500, a Manual order was not sent (a dialog value did not match)
+    MRPC_MANUAL_NOT_SENT = "MRPC_MANUAL_NOT_SENT"
     MRPC_TRADE_EA_NOT_READY = "MRPC_TRADE_EA_NOT_READY"  #: 503, nothing executed
     MRPC_TRADE_EA_STOPPED = "MRPC_TRADE_EA_STOPPED"  #: 500, nothing executed
     #: 504, gave up before the terminal took the command (not executed)

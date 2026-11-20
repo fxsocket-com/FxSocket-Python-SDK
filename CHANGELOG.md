@@ -7,6 +7,38 @@ up to 0.7.0 are described in their tagged commits.
 
 ## [Unreleased]
 
+Support for terminal bridges MT5 0.18.3 / MT4 0.16.2. Everything new is
+additive: on older bridges the new fields keep their defaults.
+
+### Added
+
+- `HistoryTrade.sl` / `.tp` (`order_history()`) and `PositionTrade.sl` /
+  `.tp` (`position_history()`): the stop-loss and take-profit of closed
+  trades, `0` when not set. On MT5 an `In` deal carries the opening
+  order's levels and an `Out` deal the position's levels at close; a
+  position row has the levels it closed with. Needs MT5 0.18.3 / MT4
+  0.16.2; `0` on older bridges and on cTrader.
+- `AccountHealth.auth_error` (`status().account`): the broker's reason for
+  the last refused login, e.g. `"Invalid account"` for a wrong password.
+  Needs MT5 0.18.2 / MT4 0.16.1.
+- `order_close(ticket, pending_only=True)` only deletes a pending order; a
+  ticket that has filled into a position by now raises the new
+  `NotPendingError` (409 `MRPC_NOT_PENDING`) and the position stays open.
+  Needs MT5 0.18.0 / MT4 0.16.0: older bridges ignore the flag and close
+  the position.
+- `order_send(..., execution="Manual")` with the new `Execution` enum:
+  places a market order through the account's own order dialog, for
+  brokers that refuse expert trading (retcode 10026). `Buy` / `Sell` only,
+  magic 0; the SDK raises `ValidationError` for anything else before
+  sending, and `UnsupportedOnPlatformError` on cTrader. The new
+  `ManualNotSentError` (500 `MRPC_MANUAL_NOT_SENT`) means nothing was
+  sent. Needs MT5 0.18.0 / MT4 0.16.0.
+- `TerminalErrorCode.MRPC_NOT_PENDING` and `MRPC_MANUAL_NOT_SENT`.
+
+### Fixed
+
+- A 409 `MRPC_NOT_PENDING` was raised as `DuplicateAccountError`.
+
 ## [0.10.0] - 2026-11-10
 
 cTrader support. cTrader accounts speak the same terminal API as MT5, so

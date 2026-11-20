@@ -18,6 +18,19 @@ silent ``order_modify`` footgun where a literal ``0.0`` stop-loss / take-profit
 *removes* the protection — pass ``clear_stop_loss`` / ``clear_take_profit`` to
 do that explicitly, ``None`` (the default) keeps the current value.
 
+Two opt-in trade flags need bridge MT5 0.18.0 / MT4 0.16.0
+(``status().bridge.version``); older bridges ignore them:
+
+* ``order_close(ticket, pending_only=True)`` only deletes a pending order. If
+  it filled in the meantime the position stays open and
+  :class:`~fxsocket.NotPendingError` is raised. An older bridge would close
+  the position instead, so check the version before relying on it.
+* ``order_send(..., execution="Manual")`` places a market order through the
+  account's own order dialog, for brokers that refuse expert trading
+  (``account_info().trade_expert`` is ``False``). ``Buy`` / ``Sell`` only,
+  magic 0; not on cTrader. :class:`~fxsocket.ManualNotSentError` means
+  nothing was sent.
+
 No request is auto-retried — in particular order send/modify/close must never
 replay, to avoid duplicate fills. To retry an ``order_send`` safely yourself
 (after a :class:`~fxsocket.TradeOutcomeUnknownError`, say), give it a
@@ -37,6 +50,7 @@ from .._http import AsyncHTTP, SyncHTTP, auth_headers
 from ..enums import (
     PENDING_OPERATIONS,
     STOP_LIMIT_OPERATIONS,
+    Execution,
     OrderOperation,
     Platform,
     Timeframe,
@@ -276,6 +290,36 @@ def _guard_stop_limit_modify(
         )
 
 
+def coerce_execution(value: Execution | str | None) -> Execution | None:
+    if value is None or isinstance(value, Execution):
+        return value
+    norm = str(value).strip().lower()
+    for ex in Execution:
+        if ex.value.lower() == norm:
+            return ex
+    raise ValidationError(f"Unknown execution: {value!r} (EA or Manual)")
+
+
+def _validate_manual(
+    platform: Platform,
+    op: OrderOperation,
+    *,
+    magic: int | None,
+    stop_limit_price: float | None,
+    expiration: object,
+    expiration_utc: object,
+) -> None:
+    """Mirror the terminal's checks for ``execution="Manual"``, fail-fast."""
+    if platform is Platform.CTRADER:
+        raise UnsupportedOnPlatformError("execution=Manual is not supported on cTrader")
+    if op not in (OrderOperation.BUY, OrderOperation.SELL):
+        raise ValidationError("execution=Manual places market orders only (Buy, Sell)")
+    if magic:
+        raise ValidationError("execution=Manual orders always have magic 0")
+    if any(v is not None for v in (stop_limit_price, expiration, expiration_utc)):
+        raise ValidationError("execution=Manual takes no stop_limit_price, expiration")
+
+
 def _label(platform: Platform) -> str:
     return "cTrader" if platform is Platform.CTRADER else platform.value.upper()
 
@@ -310,6 +354,7 @@ def _order_send_body(
     comment: str | None,
     magic: int | None,
     client_order_id: str | None,
+    execution: Execution | None = None,
 ) -> dict[str, Any]:
     return _clean(
         {
@@ -326,8 +371,18 @@ def _order_send_body(
             "comment": comment,
             "expertId": magic,
             "clientOrderId": client_order_id,
+            "execution": execution.value if execution else None,
         }
     )
+
+
+def _order_close_body(
+    ticket: int, volume: float | None, slippage: int | None, pending_only: bool
+) -> dict[str, Any]:
+    body = _clean({"ticket": ticket, "volume": volume, "slippage": slippage})
+    if pending_only:
+        body["pendingOnly"] = True
+    return body
 
 
 def _close_all_body(
@@ -551,9 +606,20 @@ class TerminalClient:
         magic: int | None = None,
         expiration_utc: str | datetime | date | None = None,
         client_order_id: str | None = None,
+        execution: Execution | str | None = None,
     ) -> OrderResult:
         op = coerce_operation(operation)
         _guard_stop_limit_send(self.platform, op)
+        ex = coerce_execution(execution)
+        if ex is Execution.MANUAL:
+            _validate_manual(
+                self.platform,
+                op,
+                magic=magic,
+                stop_limit_price=stop_limit_price,
+                expiration=expiration,
+                expiration_utc=expiration_utc,
+            )
         _validate_order_send(
             op,
             volume=volume,
@@ -578,6 +644,7 @@ class TerminalClient:
             comment=comment,
             magic=magic,
             client_order_id=client_order_id,
+            execution=ex,
         )
         return _order_result(
             *self._http.request_with_headers("POST", "/OrderSend", json=body)
@@ -625,10 +692,11 @@ class TerminalClient:
         *,
         volume: float | None = None,
         slippage: int | None = None,
+        pending_only: bool = False,
     ) -> OrderResult:
         if volume is not None and volume < 0:
             raise ValidationError(f"volume must be >= 0, got {volume}")
-        body = _clean({"ticket": ticket, "volume": volume, "slippage": slippage})
+        body = _order_close_body(ticket, volume, slippage, pending_only)
         return _order_result(
             *self._http.request_with_headers("POST", "/OrderClose", json=body)
         )
@@ -862,9 +930,20 @@ class AsyncTerminalClient:
         magic: int | None = None,
         expiration_utc: str | datetime | date | None = None,
         client_order_id: str | None = None,
+        execution: Execution | str | None = None,
     ) -> OrderResult:
         op = coerce_operation(operation)
         _guard_stop_limit_send(self.platform, op)
+        ex = coerce_execution(execution)
+        if ex is Execution.MANUAL:
+            _validate_manual(
+                self.platform,
+                op,
+                magic=magic,
+                stop_limit_price=stop_limit_price,
+                expiration=expiration,
+                expiration_utc=expiration_utc,
+            )
         _validate_order_send(
             op,
             volume=volume,
@@ -889,6 +968,7 @@ class AsyncTerminalClient:
             comment=comment,
             magic=magic,
             client_order_id=client_order_id,
+            execution=ex,
         )
         return _order_result(
             *await self._http.request_with_headers("POST", "/OrderSend", json=body)
@@ -936,10 +1016,11 @@ class AsyncTerminalClient:
         *,
         volume: float | None = None,
         slippage: int | None = None,
+        pending_only: bool = False,
     ) -> OrderResult:
         if volume is not None and volume < 0:
             raise ValidationError(f"volume must be >= 0, got {volume}")
-        body = _clean({"ticket": ticket, "volume": volume, "slippage": slippage})
+        body = _order_close_body(ticket, volume, slippage, pending_only)
         return _order_result(
             *await self._http.request_with_headers("POST", "/OrderClose", json=body)
         )

@@ -811,6 +811,12 @@ class HistoryTrade(_Camel):
     ``comment=""``. On MT4 it equals the order ticket. 0 on pods older than
     bridge MT5 0.14 / MT4 0.13. (Netting-account caveat: a reversal
     ``InOut`` row reports the position it belongs to *after* processing.)
+
+    ``sl`` / ``tp`` are the stop-loss and take-profit levels, ``0`` when not
+    set. On MT5 they are per deal: an ``In`` row carries the opening order's
+    levels, an ``Out`` row the position's levels when it closed, a balance
+    row ``0``. On MT4 they are the order's levels at close. Always ``0`` on
+    bridges older than MT5 0.18.3 / MT4 0.16.2, and on cTrader.
     """
 
     ticket: int
@@ -827,10 +833,18 @@ class HistoryTrade(_Camel):
     magic: int
     comment: str
     time: str
+    sl: float = 0.0
+    tp: float = 0.0
 
 
 class PositionTrade(_Camel):
-    """A closed round-trip position (``GET /PositionHistory``)."""
+    """A closed round-trip position (``GET /PositionHistory``).
+
+    ``sl`` / ``tp`` are the stop-loss and take-profit the position carried
+    when it closed (``0`` = not set), the values the terminal's History tab
+    shows. Always ``0`` on bridges older than MT5 0.18.3 / MT4 0.16.2, and on
+    cTrader.
+    """
 
     position_id: int
     symbol: str
@@ -846,6 +860,8 @@ class PositionTrade(_Camel):
     net_profit: float
     magic: int
     comment: str
+    sl: float = 0.0
+    tp: float = 0.0
 
 
 class ServerTimezone(_Camel):
@@ -1200,13 +1216,20 @@ class BrokerHealth(_Camel):
 
 class AccountHealth(_Camel):
     """Account section of ``/status``. ``currency`` / ``type`` are blank when
-    not logged in; ``login`` is always the configured account."""
+    not logged in; ``login`` is always the configured account.
+
+    ``auth_error`` is the broker's reason for the last refused login while
+    the account is not logged in, as the terminal words it (``"Invalid
+    account"`` for a wrong login or password). ``""`` while logged in, before
+    the first refusal, and on bridges older than MT5 0.18.2 / MT4 0.16.1.
+    """
 
     logged_in: bool
     login: int = 0
     currency: str = ""
     type: str = ""
     trade_allowed: bool = False
+    auth_error: str = ""
 
 
 class BridgeHealth(_Camel):

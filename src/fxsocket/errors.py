@@ -239,6 +239,18 @@ class ClientOrderIdReusedError(FxSocketError):
     remembered for 10 minutes; use a fresh one per order."""
 
 
+class NotPendingError(FxSocketError):
+    """A ``pending_only`` close found a position, not a pending order (HTTP
+    409 ``MRPC_NOT_PENDING``): the order filled before the delete. Nothing
+    was closed; the position is yours to keep or close."""
+
+
+class ManualNotSentError(FxSocketError):
+    """A ``Manual`` order was not sent (HTTP 500 ``MRPC_MANUAL_NOT_SENT``):
+    a value read back from the order dialog did not match, so nothing went
+    to the broker. Safe to repeat; ``str(err)`` says which step failed."""
+
+
 class UnsupportedOnPlatformError(FxSocketError):
     """A requested feature doesn't exist on the account's platform.
 
@@ -314,6 +326,8 @@ def error_from_response(resp: httpx.Response) -> FxSocketError:
     if status == 409:
         if code == "MRPC_CLIENT_ORDER_ID_REUSED":
             return ClientOrderIdReusedError(message, **common)
+        if code == "MRPC_NOT_PENDING":
+            return NotPendingError(message, **common)
         if code == "slots_full" and isinstance(body, dict):
             return SlotsFullError(
                 message, used=body.get("used"), cap=body.get("cap"), **common
@@ -357,4 +371,6 @@ def error_from_response(resp: httpx.Response) -> FxSocketError:
         if code == "MRPC_ABANDONED":
             return TradeAbandonedError(message, **common)
         return TerminalTimeoutError(message, **common)
+    if code == "MRPC_MANUAL_NOT_SENT":
+        return ManualNotSentError(message, **common)
     return FxSocketError(message, **common)
