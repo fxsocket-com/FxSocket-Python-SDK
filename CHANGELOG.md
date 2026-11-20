@@ -7,6 +7,8 @@ up to 0.7.0 are described in their tagged commits.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-20
+
 Support for terminal bridges MT5 0.18.3 / MT4 0.16.2. Everything new is
 additive: on older bridges the new fields keep their defaults.
 
@@ -154,6 +156,7 @@ endpoints are not served and `since` is ignored.
 - `fxsocket.enums.MT5_ONLY_TIMEFRAMES` is always empty and will be removed in
   1.0.
 
+[0.11.0]: https://github.com/fxsocket-com/FxSocket-Python-SDK/releases/tag/v0.11.0
 [0.10.0]: https://github.com/fxsocket-com/FxSocket-Python-SDK/releases/tag/v0.10.0
 [0.9.0]: https://github.com/fxsocket-com/FxSocket-Python-SDK/releases/tag/v0.9.0
 [0.8.0]: https://github.com/fxsocket-com/FxSocket-Python-SDK/releases/tag/v0.8.0
