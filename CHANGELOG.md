@@ -7,6 +7,8 @@ up to 0.7.0 are described in their tagged commits.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-23
+
 cTrader sign-in through the API, and the trading extras of cTrader bridge
 0.1.6. Everything new is additive: MT4 and MT5 rows keep the defaults.
 
@@ -203,6 +205,7 @@ endpoints are not served and `since` is ignored.
 - `fxsocket.enums.MT5_ONLY_TIMEFRAMES` is always empty and will be removed in
   1.0.
 
+[0.12.0]: https://github.com/fxsocket-com/FxSocket-Python-SDK/releases/tag/v0.12.0
 [0.11.0]: https://github.com/fxsocket-com/FxSocket-Python-SDK/releases/tag/v0.11.0
 [0.10.0]: https://github.com/fxsocket-com/FxSocket-Python-SDK/releases/tag/v0.10.0
 [0.9.0]: https://github.com/fxsocket-com/FxSocket-Python-SDK/releases/tag/v0.9.0
