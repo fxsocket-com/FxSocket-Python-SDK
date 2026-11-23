@@ -1664,3 +1664,451 @@ async def test_async_pending_only_and_manual() -> None:
         )
     assert json.loads(close.calls.last.request.content)["pendingOnly"] is True
     assert json.loads(send.calls.last.request.content)["execution"] == "Manual"
+
+
+# --------------------------------------------------------------------------- #
+# cTrader bridge 0.1.6: stop loss kinds, client_order_id on modify / close,
+# the journal, and the new row fields
+# --------------------------------------------------------------------------- #
+
+_OPENED_ROW = {
+    "ticket": 1,
+    "symbol": "EURUSD",
+    "type": "Buy",
+    "kind": "Position",
+    "lots": 0.1,
+    "openPrice": 1.08,
+    "currentPrice": 1.085,
+    "stopLoss": 1.07,
+    "takeProfit": 0.0,
+    "swap": 0.0,
+    "profit": 5.0,
+    "magic": 0,
+    "comment": "",
+    "openTime": "2026-11-23T10:00:00Z",
+}
+
+
+@respx.mock
+def test_ctrader_order_send_stop_kinds() -> None:
+    route = respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    with _term(platform="ctrader") as t:
+        t.order_send(
+            symbol="EURUSD",
+            operation="Buy",
+            volume=0.01,
+            stop_loss=1.07,
+            trailing_stop=True,
+            guaranteed_stop_loss=False,
+        )
+    body = json.loads(route.calls.last.request.content)
+    assert body["trailingStop"] is True and body["guaranteedStopLoss"] is False
+    assert body["stopLoss"] == 1.07
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"trailing_stop": True},
+        {"guaranteed_stop_loss": True},
+        {"guaranteed_stop_loss": True, "stop_loss": 0.0},
+    ],
+)
+@respx.mock
+def test_ctrader_stop_kinds_need_a_stop_loss(kwargs: dict) -> None:
+    route = respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    with _term(platform="ctrader") as t:
+        with pytest.raises(ValidationError, match="stop_loss"):
+            t.order_send(symbol="EURUSD", operation="Buy", volume=0.01, **kwargs)
+    assert not route.called
+
+
+@pytest.mark.parametrize("platform", ["mt4", "mt5"])
+@pytest.mark.parametrize("field", ["trailing_stop", "guaranteed_stop_loss"])
+@respx.mock
+def test_stop_kinds_refused_on_mt(platform: str, field: str) -> None:
+    send = respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    modify = respx.post(f"{TERM}/OrderModify").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    with _term(platform=platform) as t:
+        with pytest.raises(UnsupportedOnPlatformError, match="cTrader"):
+            t.order_send(
+                symbol="EURUSD",
+                operation="Buy",
+                volume=0.01,
+                stop_loss=1.07,
+                **{field: True},
+            )
+        with pytest.raises(UnsupportedOnPlatformError, match="cTrader"):
+            t.order_modify(1, **{field: True})
+    assert not send.called and not modify.called
+
+
+@respx.mock
+def test_stop_kinds_false_is_not_sent_on_mt() -> None:
+    send = respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    modify = respx.post(f"{TERM}/OrderModify").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    with _term(platform="mt5") as t:
+        t.order_send(
+            symbol="EURUSD",
+            operation="Buy",
+            volume=0.01,
+            trailing_stop=False,
+            guaranteed_stop_loss=False,
+        )
+        t.order_modify(1, stop_loss=1.07, trailing_stop=False)
+    sent = json.loads(send.calls.last.request.content)
+    assert "trailingStop" not in sent and "guaranteedStopLoss" not in sent
+    assert json.loads(modify.calls.last.request.content) == {
+        "ticket": 1,
+        "stopLoss": 1.07,
+    }
+
+
+@respx.mock
+def test_ctrader_order_modify_stop_kinds_and_client_order_id() -> None:
+    route = respx.post(f"{TERM}/OrderModify").mock(
+        return_value=httpx.Response(
+            200,
+            json={**_ORDER_OK, "clientOrderId": "mod-1"},
+            headers={"Idempotent-Replayed": "true"},
+        )
+    )
+    with _term(platform="ctrader") as t:
+        res = t.order_modify(
+            7,
+            trailing_stop=False,
+            guaranteed_stop_loss=True,
+            client_order_id="mod-1",
+        )
+    assert json.loads(route.calls.last.request.content) == {
+        "ticket": 7,
+        "trailingStop": False,
+        "guaranteedStopLoss": True,
+        "clientOrderId": "mod-1",
+    }
+    assert res.idempotent_replayed is True and res.client_order_id == "mod-1"
+
+
+def test_ctrader_order_modify_clear_stop_loss_with_a_stop_kind() -> None:
+    with _term(platform="ctrader") as t, pytest.raises(ValidationError):
+        t.order_modify(7, clear_stop_loss=True, trailing_stop=True)
+
+
+@respx.mock
+def test_ctrader_order_close_client_order_id() -> None:
+    route = respx.post(f"{TERM}/OrderClose").mock(
+        return_value=httpx.Response(
+            200, json=_ORDER_OK, headers={"Idempotent-Replayed": "true"}
+        )
+    )
+    with _term(platform="ctrader") as t:
+        res = t.order_close(7, volume=0.01, client_order_id="close-1")
+    assert json.loads(route.calls.last.request.content) == {
+        "ticket": 7,
+        "volume": 0.01,
+        "clientOrderId": "close-1",
+    }
+    assert res.idempotent_replayed is True
+
+
+@respx.mock
+def test_ctrader_close_client_order_id_reused() -> None:
+    respx.post(f"{TERM}/OrderClose").mock(
+        return_value=httpx.Response(
+            409,
+            json={
+                "error": "MRPC_CLIENT_ORDER_ID_REUSED",
+                "message": "this clientOrderId was already used",
+            },
+        )
+    )
+    with _term(platform="ctrader") as t, pytest.raises(ClientOrderIdReusedError):
+        t.order_close(7, client_order_id="send-1")
+
+
+@pytest.mark.parametrize("platform", ["mt4", "mt5"])
+@respx.mock
+def test_client_order_id_on_modify_and_close_refused_on_mt(platform: str) -> None:
+    modify = respx.post(f"{TERM}/OrderModify").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    close = respx.post(f"{TERM}/OrderClose").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    with _term(platform=platform) as t:
+        with pytest.raises(UnsupportedOnPlatformError, match="order_modify"):
+            t.order_modify(1, stop_loss=1.07, client_order_id="x")
+        with pytest.raises(UnsupportedOnPlatformError, match="order_close"):
+            t.order_close(1, client_order_id="x")
+    assert not modify.called and not close.called
+
+
+@pytest.mark.parametrize("bad", ["", "x" * 65, 5])
+def test_ctrader_modify_close_client_order_id_validated(bad: object) -> None:
+    with _term(platform="ctrader") as t:
+        with pytest.raises(ValidationError):
+            t.order_modify(1, stop_loss=1.0, client_order_id=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValidationError):
+            t.order_close(1, client_order_id=bad)  # type: ignore[arg-type]
+
+
+_JOURNAL = {
+    "entries": [
+        {
+            "seq": 12,
+            "time": "2026-11-23T14:05:01.234Z",
+            "kind": "trade",
+            "event": "OrderClose",
+            "message": "OrderClose 7: done",
+            "request": {"ticket": 7, "volume": 0.01},
+            "result": {"success": True, "retcode": 10009, "deal": 99},
+            "clientOrderId": "close-1",
+            "durationMs": 84,
+            "commandId": 3,
+            "userAgent": "fxsocket-python/0.12.0",
+            "clientIp": "203.0.113.9",
+        },
+        {
+            "seq": 1,
+            "time": "2026-11-23T13:00:00.000Z",
+            "kind": "connection",
+            "event": "signed_in",
+            "message": "signed in",
+        },
+    ]
+}
+
+
+@respx.mock
+def test_ctrader_journal() -> None:
+    route = respx.get(f"{TERM}/Journal").mock(
+        return_value=httpx.Response(200, json=_JOURNAL)
+    )
+    with _term(platform="ctrader") as t:
+        entries = t.journal(
+            limit=50,
+            since=datetime(2026, 11, 23, 12, 0, 0, 250000, tzinfo=timezone.utc),
+            kind="Trade",
+        )
+    params = route.calls.last.request.url.params
+    assert params["limit"] == "50"
+    assert params["since"] == "2026-11-23T12:00:00.250Z"
+    assert params["kind"] == "trade"
+    trade, conn = entries
+    assert trade.seq == 12 and trade.event == "OrderClose"
+    assert trade.request == {"ticket": 7, "volume": 0.01}
+    assert trade.result is not None and trade.result["deal"] == 99
+    assert trade.client_order_id == "close-1" and trade.duration_ms == 84
+    assert trade.command_id == 3 and trade.client_ip == "203.0.113.9"
+    assert trade.user_agent == "fxsocket-python/0.12.0"
+    assert conn.kind == "connection" and conn.request is None
+    assert conn.client_order_id is None and conn.duration_ms is None
+
+
+@respx.mock
+def test_ctrader_journal_defaults_send_no_params() -> None:
+    route = respx.get(f"{TERM}/Journal").mock(
+        return_value=httpx.Response(200, json={"entries": []})
+    )
+    with _term(platform="ctrader") as t:
+        assert t.journal() == []
+    assert dict(route.calls.last.request.url.params) == {}
+
+
+@pytest.mark.parametrize(
+    ("since", "wire"),
+    [
+        (datetime(2026, 11, 23, 9, 0, 0), "2026-11-23T09:00:00.000Z"),
+        (
+            datetime(2026, 11, 23, 9, 0, 0, tzinfo=timezone(timedelta(hours=2))),
+            "2026-11-23T07:00:00.000Z",
+        ),
+        (date(2026, 11, 23), "2026-11-23T00:00:00.000Z"),
+        ("2026-11-22T21:00:00Z", "2026-11-22T21:00:00Z"),
+    ],
+)
+@respx.mock
+def test_ctrader_journal_since_formats(since: object, wire: str) -> None:
+    from fxsocket import JournalKind
+
+    route = respx.get(f"{TERM}/Journal").mock(
+        return_value=httpx.Response(200, json={"entries": []})
+    )
+    with _term(platform="ctrader") as t:
+        t.journal(since=since, kind=JournalKind.CONNECTION)  # type: ignore[arg-type]
+    params = route.calls.last.request.url.params
+    assert params["since"] == wire and params["kind"] == "connection"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"limit": 0}, {"limit": 1001}, {"limit": True}, {"limit": 1.5}, {"kind": "x"}],
+)
+def test_ctrader_journal_validated(kwargs: dict) -> None:
+    with _term(platform="ctrader") as t, pytest.raises(ValidationError):
+        t.journal(**kwargs)
+
+
+@pytest.mark.parametrize("platform", ["mt4", "mt5"])
+@respx.mock
+def test_journal_refused_on_mt(platform: str) -> None:
+    route = respx.get(f"{TERM}/Journal").mock(return_value=httpx.Response(404, json={}))
+    with _term(platform=platform) as t, pytest.raises(UnsupportedOnPlatformError):
+        t.journal()
+    assert not route.called
+
+
+@respx.mock
+def test_ctrader_row_fields() -> None:
+    respx.get(f"{TERM}/OpenedOrders").mock(
+        return_value=httpx.Response(
+            200,
+            json=[{**_OPENED_ROW, "trailingStop": True, "guaranteedStopLoss": True}],
+        )
+    )
+    respx.get(f"{TERM}/PendingOrders").mock(
+        return_value=httpx.Response(
+            200, json=[{**_PENDING, "trailingStop": True, "guaranteedStopLoss": False}]
+        )
+    )
+    with _term(platform="ctrader") as t:
+        (opened,) = t.opened_orders()
+        (pending,) = t.pending_orders()
+    assert opened.trailing_stop is True and opened.guaranteed_stop_loss is True
+    assert pending.trailing_stop is True and pending.guaranteed_stop_loss is False
+
+
+def test_ctrader_fields_default_on_mt_rows() -> None:
+    from fxsocket import AccountInfo, OpenedOrder, PendingOrder, SymbolInfo
+
+    opened = OpenedOrder.model_validate(_OPENED_ROW)
+    assert opened.trailing_stop is False and opened.guaranteed_stop_loss is False
+    pending = PendingOrder.model_validate(_PENDING)
+    assert pending.trailing_stop is False and pending.guaranteed_stop_loss is False
+    info = AccountInfo.model_validate(
+        {
+            "name": "J",
+            "login": 1,
+            "server": "s",
+            "company": "c",
+            "currency": "USD",
+            "currencyDigits": 2,
+            "leverage": 100,
+            "type": "Demo",
+            "marginMode": "Hedging",
+            "marginSoMode": "Percent",
+            "marginCallLevel": 100.0,
+            "stopOutLevel": 50.0,
+            "tradeAllowed": True,
+            "tradeExpert": True,
+            "limitOrders": 0,
+            "fifoClose": False,
+        }
+    )
+    assert info.limited_risk is False
+    assert AccountInfo.model_validate(
+        {**info.model_dump(by_alias=True), "limitedRisk": True}
+    ).limited_risk
+    spec = {
+        "symbol": "EURUSD",
+        "description": "",
+        "digits": 5,
+        "point": 0.00001,
+        "tickSize": 0.00001,
+        "tickValue": 1.0,
+        "contractSize": 100000.0,
+        "volumeMin": 0.01,
+        "volumeMax": 500.0,
+        "volumeStep": 0.01,
+        "stopsLevel": 0,
+        "freezeLevel": 0,
+        "spread": 15,
+        "tradeMode": "Full",
+        "swapLong": 0.0,
+        "swapShort": 0.0,
+        "bid": 1.0,
+        "ask": 1.0,
+        "currencyBase": "EUR",
+        "currencyProfit": "USD",
+        "currencyMargin": "USD",
+    }
+    si = SymbolInfo.model_validate(spec)
+    assert si.guaranteed_stop_loss is False and si.gsl_distance == 0
+    gsl = SymbolInfo.model_validate(
+        {**spec, "guaranteedStopLoss": True, "gslDistance": 50}
+    )
+    assert gsl.guaranteed_stop_loss is True and gsl.gsl_distance == 50
+
+
+def test_ctrader_positions_and_orders_frames_carry_stop_kinds() -> None:
+    from fxsocket.terminal.stream import OrdersUpdate, PositionsUpdate, parse_event
+
+    pos = parse_event(
+        {"type": "positions", "data": [{**_OPENED_ROW, "trailingStop": True}]}
+    )
+    assert isinstance(pos, PositionsUpdate) and pos.data[0].trailing_stop is True
+    orders = parse_event(
+        {"type": "orders", "data": [{**_PENDING, "guaranteedStopLoss": True}]}
+    )
+    assert isinstance(orders, OrdersUpdate)
+    assert orders.data[0].guaranteed_stop_loss is True
+
+
+@respx.mock
+async def test_async_ctrader_extras() -> None:
+    journal = respx.get(f"{TERM}/Journal").mock(
+        return_value=httpx.Response(200, json=_JOURNAL)
+    )
+    modify = respx.post(f"{TERM}/OrderModify").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    close = respx.post(f"{TERM}/OrderClose").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    send = respx.post(f"{TERM}/OrderSend").mock(
+        return_value=httpx.Response(200, json=_ORDER_OK)
+    )
+    async with AsyncTerminalClient(
+        base_url=TERM, api_key="fxs_live_k", platform="ctrader"
+    ) as t:
+        entries = await t.journal(kind="trade", limit=10)
+        await t.order_send(
+            symbol="EURUSD",
+            operation="Sell",
+            volume=0.01,
+            stop_loss=1.2,
+            guaranteed_stop_loss=True,
+        )
+        await t.order_modify(5, trailing_stop=True, client_order_id="m")
+        await t.order_close(5, client_order_id="c")
+    assert entries[0].seq == 12
+    assert journal.calls.last.request.url.params["kind"] == "trade"
+    assert json.loads(send.calls.last.request.content)["guaranteedStopLoss"] is True
+    assert json.loads(modify.calls.last.request.content) == {
+        "ticket": 5,
+        "trailingStop": True,
+        "clientOrderId": "m",
+    }
+    assert json.loads(close.calls.last.request.content)["clientOrderId"] == "c"
+
+
+async def test_async_journal_refused_on_mt() -> None:
+    async with AsyncTerminalClient(
+        base_url=TERM, api_key="fxs_live_k", platform="mt5"
+    ) as t:
+        with pytest.raises(UnsupportedOnPlatformError):
+            await t.journal()
+        with pytest.raises(UnsupportedOnPlatformError):
+            await t.order_close(1, client_order_id="c")

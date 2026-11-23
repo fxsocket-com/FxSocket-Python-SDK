@@ -13,7 +13,7 @@ interfaces.
 ## Features
 
 - **Account management** — link, list, fetch, and disconnect MT4/MT5 accounts;
-  list and disconnect cTrader accounts (those are linked from the dashboard).
+  link cTrader accounts with a cTrader sign-in.
 - **Private servers** — list your dedicated hosting servers and manage the
   accounts on them.
 - **Read-only keys** — mint, scope, rotate and revoke `fxs_ro_…` keys for
@@ -298,15 +298,132 @@ cTrader's fills within a range beyond the stop instead of resting as a limit,
 so `BuyStopLimit` / `SellStopLimit` (and `stop_limit_price` on `order_modify`)
 raise `UnsupportedOnPlatformError` on MT4 and cTrader before anything is sent.
 
-cTrader accounts are linked from the FxSocket dashboard with a cTrader ID
-sign-in, so `accounts.create(platform="ctrader")` raises `ValidationError`.
-Once linked, a cTrader account is listed, traded and streamed like any other:
-its `rest_url` is `https://api.fxsocket.com/ctrader/<account id>`.
+cTrader accounts have no password, so `accounts.create(platform="ctrader")`
+raises `ValidationError`. Link them with a cTrader sign-in instead (see
+[cTrader](#ctrader)). Once linked, a cTrader account is listed, traded and
+streamed like any other: its `rest_url` is
+`https://api.fxsocket.com/ctrader/<account id>`.
 
 > **MT4 history note:** on MT4, `price_history` with `from_`/`to` bounds (or the
 > `D1` timeframe) can fail server-side with `CopyRates failed` when the terminal
 > hasn't loaded that history. Calling `price_history(symbol, timeframe)` without
 > date bounds returns the most recent bars reliably.
+
+## cTrader
+
+### Linking accounts with a sign-in
+
+cTrader accounts are linked through the user's own cTrader ID, not a password.
+Start a sign-in, send the user's browser to `authorize_url` (cTrader's consent
+page), wait until they are done, then link the accounts they granted:
+
+```python
+started = fx.ctrader_sign_ins.create(
+    return_url="https://app.example.com/ctrader/done",   # optional
+)
+redirect_user_to(started.authorize_url)    # a redirect or a new tab, no iframe
+
+sign_in = fx.ctrader_sign_ins.wait(started)   # polls until no longer pending
+if sign_in.status != "completed":
+    raise RuntimeError(f"cTrader sign-in {sign_in.status}: {sign_in.error}")
+
+for row in sign_in.accounts:
+    print(row.ctrader_account_id, row.login, row.broker, row.live,
+          row.unavailable_reason, row.linked_account_id)
+
+results = fx.ctrader_sign_ins.link_accounts(
+    sign_in,
+    [{"ctrader_account_id": a.ctrader_account_id, "nickname": "Main"}
+     for a in sign_in.linkable_accounts],
+)
+for r in results:
+    if r.is_linked:
+        print("linked", r.account.id, r.account.status)
+    else:
+        print("refused", r.ctrader_account_id, r.error, r.detail)
+```
+
+- The user has 10 minutes for the consent page. After it the browser goes to
+  `return_url` with `fxsocket_sign_in=<id>&status=<status>` added, or to an
+  FxSocket page that asks them to return to your app. A `return_url` must be
+  https (http only for localhost) on an origin FxSocket has allowed for you;
+  ask support to add yours.
+- `wait()` polls `get()` every 2 seconds for up to 11 minutes (`interval`,
+  `timeout`) and returns the sign-in as soon as it is `completed`, `denied`,
+  `failed` or `expired`, or still `pending` when the timeout ran out. Check
+  `status`. You can also call `get()` yourself when the browser comes back.
+- `link_accounts()` takes up to 50 accounts: ids, rows of `sign_in.accounts`,
+  or mappings with `ctrader_account_id` and an optional `nickname`. It
+  answers one `CtraderLinkResult` per account, in order, with the same plan,
+  seat and duplicate rules as `accounts.create()`. Linking works for 60
+  minutes after the user came back, and a repeat of the same call is safe.
+- At most 20 sign-ins may wait at once and 60 may be started per hour, else
+  `SignInLimitError` (a `RateLimitError` with `retry_after` and `limit`).
+- All of this needs the full key. Whoever holds it and gets someone to allow
+  access gets trading access to their cTrader accounts, so keep the key on
+  your server.
+
+An account whose access was revoked in the user's cTrader ID settings reads
+`account.reauth_required == True` and stays down until its owner signs in
+again.
+
+### Trading extras
+
+cTrader has its own stop loss kinds. `trailing_stop=True` makes the stop loss
+trail the price, `guaranteed_stop_loss=True` makes it guaranteed (filled at
+its level even through a gap, for a fee) where the broker offers it. Both need
+a `stop_loss`:
+
+```python
+term = fx.terminal(account)          # a cTrader account
+
+term.order_send(symbol="EURUSD", operation="Buy", volume=0.10,
+                stop_loss=1.0750, trailing_stop=True)
+term.order_modify(ticket, trailing_stop=False)        # None keeps it
+
+spec = term.symbol_info("EURUSD")
+print(spec.guaranteed_stop_loss, spec.gsl_distance)   # offered? least distance
+print(term.account_info().limited_risk)  # guaranteed stop loss on every order
+```
+
+On a limited-risk account every order gets a guaranteed stop loss by default
+and needs a `stop_loss`. `opened_orders()` and `pending_orders()` rows (and
+the `positions` and `orders` stream frames) say `trailing_stop` and
+`guaranteed_stop_loss`.
+
+`order_modify` and `order_close` take a `client_order_id` too, so a modify or
+a partial close that timed out can be sent again with the same id. The ids of
+send, modify and close are one set: a repeat answers with the first outcome
+(`idempotent_replayed`), and an id reused for a different request raises
+`ClientOrderIdReusedError`.
+
+### Journal
+
+`journal()` lists the account's connection events (signed in, ready,
+connection lost and back, token refreshed or refused) and every trade request
+with its request, outcome, duration, `client_order_id`, `User-Agent` and
+client address, newest first:
+
+```python
+from datetime import datetime, timedelta, timezone
+
+since = datetime.now(timezone.utc) - timedelta(hours=1)
+for entry in term.journal(kind="trade", since=since, limit=200):
+    print(entry.time, entry.event, entry.message, entry.client_order_id,
+          entry.duration_ms, entry.result)
+```
+
+`limit` is 1 to 1000 (100 by default). The journal lives in the bridge's
+memory: the newest 1000 entries of at most 7 days, and a bridge restart
+empties it. Use `order_history()` for the full record.
+
+These are cTrader only. On MT4 and MT5 `journal()`, `trailing_stop=True`,
+`guaranteed_stop_loss=True` and a `client_order_id` on `order_modify` /
+`order_close` raise `UnsupportedOnPlatformError` before anything is sent.
+In `client.orders.send()` legs the stop loss kinds work the same way, but the
+SDK does not know each leg's platform there, so an MT4 or MT5 leg with either
+set to `True` fails the whole batch at the API (`ValidationError`,
+`invalid_batch`).
 
 ## Multi-account trading
 
@@ -523,7 +640,9 @@ Every failure raises a subclass of `fxsocket.FxSocketError`:
 | `AuthError` | missing/invalid API key |
 | `ForbiddenError` | key not allowed to do this (read-only key on a mutating call) |
 | `RateLimitError` | rate limited (`.retry_after`) |
+| `SignInLimitError` | too many cTrader sign-ins (`.retry_after`, `.limit`) |
 | `ValidationError` | malformed request (`.code`: `invalid_batch`, `unknown_account`, …) |
+| `CtraderAccountNotInSignInError` | linking an account the sign-in did not grant (`.ctrader_account_ids`) |
 | `IdempotencyError` | batch refused because of its `Idempotency-Key` (`.code`) |
 | `NotFoundError` | account/resource not found |
 | `PaymentRequiredError` | base for every 402 below (plan / balance doesn't allow it) |
@@ -533,12 +652,15 @@ Every failure raises a subclass of `fxsocket.FxSocketError`:
 | `SeatLapsedError` | seats lapsed, existing accounts unseated — renew first |
 | `DuplicateAccountError` | account already linked |
 | `ConnectFailedError` | broker rejected the login |
+| `SignInNotCompletedError` | linking from a sign-in that is not completed (`.sign_in_status`) |
+| `SignInExpiredError` | linking from a sign-in that has expired |
+| `CtraderReauthRequiredError` | cTrader no longer accepts the sign-in; start a new one |
 | `ClientOrderIdReusedError` | `client_order_id` already used for a different order |
 | `TerminalNotReadyError` | terminal not provisioned / not ready (nothing executed) |
 | `TerminalTimeoutError` | the terminal didn't answer in time (base of the two below) |
 | `TradeOutcomeUnknownError` | a trade timed out after the terminal took it; may have executed |
 | `TradeAbandonedError` | a trade never reached the terminal; safe to resend |
-| `UnsupportedOnPlatformError` | feature not available on this platform (stop-limit on MT4) |
+| `UnsupportedOnPlatformError` | feature not available on this platform (stop-limit on MT4, the journal on MT5) |
 
 Terminal errors carry a fixed code in `.code`; branch on it (compare against
 `TerminalErrorCode`, e.g. `MRPC_UNKNOWN_SYMBOL`, `MRPC_SYMBOL_NOT_QUOTING`),

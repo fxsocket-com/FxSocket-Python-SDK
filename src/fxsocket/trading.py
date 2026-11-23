@@ -41,7 +41,11 @@ from .models import (
     OrderLeg,
     PrivateServerAccount,
 )
-from .terminal.client import _validate_order_send, coerce_operation
+from .terminal.client import (
+    _check_stop_kinds_need_stop_loss,
+    _validate_order_send,
+    coerce_operation,
+)
 
 #: Anything ``client.orders.send()`` accepts as one leg: a full
 #: :class:`OrderLeg`, a plain mapping with the same keys, or just the account
@@ -123,6 +127,11 @@ def _validate_effective_order(effective: dict[str, Any], where: str) -> None:
             stop_limit_price=effective.get("stop_limit_price"),
             stop_loss=effective.get("stop_loss"),
             take_profit=effective.get("take_profit"),
+        )
+        _check_stop_kinds_need_stop_loss(
+            effective.get("trailing_stop"),
+            effective.get("guaranteed_stop_loss"),
+            effective.get("stop_loss"),
         )
     except ValidationError as exc:
         raise ValidationError(f"{where}: {exc.message}") from None
@@ -292,6 +301,13 @@ class Orders:
         (:class:`~fxsocket.ValidationError`, ``unreachable_account``) if any
         account has no terminal, instead of reporting that leg as
         ``"unreachable"``. A pre-dispatch check only.
+
+        ``trailing_stop`` and ``guaranteed_stop_loss`` are cTrader only and
+        need a ``stop_loss``. The SDK does not know each leg's platform, so
+        a leg for an MT4 or MT5 account with either set to ``True`` is
+        refused by the API: the whole batch fails with
+        :class:`~fxsocket.ValidationError` (``invalid_batch``) and nothing
+        is sent.
         """
         body = build_order_batch(
             orders, defaults=defaults, require_reachable=require_reachable

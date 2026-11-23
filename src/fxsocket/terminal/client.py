@@ -1,4 +1,4 @@
-"""Per-account terminal REST client (MT4 + MT5).
+"""Per-account terminal REST client (MT4, MT5 and cTrader).
 
 One :class:`TerminalClient` (sync) / :class:`AsyncTerminalClient` (async) is
 bound to a single account's terminal endpoint (``Account.rest_url``). The two
@@ -31,6 +31,21 @@ Two opt-in trade flags need bridge MT5 0.18.0 / MT4 0.16.0
   magic 0; not on cTrader. :class:`~fxsocket.ManualNotSentError` means
   nothing was sent.
 
+cTrader accounts (bridge 0.1.6) add a few things MT4 and MT5 do not have:
+
+* ``trailing_stop`` and ``guaranteed_stop_loss`` on ``order_send`` and
+  ``order_modify``, cTrader's own stop loss kinds. Both need a stop loss.
+* ``client_order_id`` on ``order_modify`` and ``order_close`` too. On
+  cTrader the ids of send, modify and close are one set.
+* :meth:`TerminalClient.journal`, the account's connection events and
+  trade requests.
+
+The client knows the account's platform, so on MT4 and MT5 these raise
+:class:`~fxsocket.UnsupportedOnPlatformError` before anything is sent (the
+MT terminals would silently ignore the fields). ``trailing_stop=False`` and
+``guaranteed_stop_loss=False`` are not sent there, since every MT stop loss
+is already a fixed, normal one.
+
 No request is auto-retried — in particular order send/modify/close must never
 replay, to avoid duplicate fills. To retry an ``order_send`` safely yourself
 (after a :class:`~fxsocket.TradeOutcomeUnknownError`, say), give it a
@@ -51,6 +66,7 @@ from ..enums import (
     PENDING_OPERATIONS,
     STOP_LIMIT_OPERATIONS,
     Execution,
+    JournalKind,
     OrderOperation,
     Platform,
     Timeframe,
@@ -68,6 +84,7 @@ from ..models import (
     Health,
     HealthChecks,
     HistoryTrade,
+    JournalEntry,
     MarginCalc,
     OpenedOrder,
     OrderResult,
@@ -158,6 +175,17 @@ def _validate_order_send(
         raise ValidationError(f"stop_loss must be >= 0, got {stop_loss}")
     if take_profit is not None and take_profit < 0:
         raise ValidationError(f"take_profit must be >= 0, got {take_profit}")
+
+
+def _check_stop_kinds_need_stop_loss(
+    trailing_stop: bool | None,
+    guaranteed_stop_loss: bool | None,
+    stop_loss: float | None,
+) -> None:
+    """``order_send``: a trailing or guaranteed stop loss needs a stop loss
+    (the terminal answers 400 otherwise)."""
+    if (trailing_stop or guaranteed_stop_loss) and not (stop_loss and stop_loss > 0):
+        raise ValidationError("trailing_stop and guaranteed_stop_loss need a stop_loss")
 
 
 def _resolve_modify_sl_tp(
@@ -324,6 +352,94 @@ def _label(platform: Platform) -> str:
     return "cTrader" if platform is Platform.CTRADER else platform.value.upper()
 
 
+def _stop_kinds(
+    platform: Platform,
+    trailing_stop: bool | None,
+    guaranteed_stop_loss: bool | None,
+) -> tuple[bool | None, bool | None]:
+    """cTrader's stop loss kinds, as they go on the wire.
+
+    On MT4 / MT5 ``True`` is refused (the platform has no such stop loss)
+    and ``False`` is dropped: every MT stop loss is fixed and not guaranteed
+    already, and the MT terminals would ignore the field.
+    """
+    if platform is Platform.CTRADER:
+        return trailing_stop, guaranteed_stop_loss
+    for name, value in (
+        ("trailing_stop", trailing_stop),
+        ("guaranteed_stop_loss", guaranteed_stop_loss),
+    ):
+        if value:
+            raise UnsupportedOnPlatformError(
+                f"{name} is only supported on cTrader, not on {_label(platform)}"
+            )
+    return None, None
+
+
+def _ctrader_client_order_id(
+    platform: Platform, client_order_id: str | None, call: str
+) -> str | None:
+    """``client_order_id`` on ``order_modify`` / ``order_close``: cTrader
+    only (the MT terminals would ignore it, so a retry would not be safe)."""
+    if client_order_id is None:
+        return None
+    if platform is not Platform.CTRADER:
+        raise UnsupportedOnPlatformError(
+            f"client_order_id on {call} is only supported on cTrader, "
+            f"not on {_label(platform)}"
+        )
+    _check_client_order_id(client_order_id)
+    return client_order_id
+
+
+_MAX_JOURNAL = 1000
+
+
+def _journal_params(
+    platform: Platform,
+    limit: int | None,
+    since: str | datetime | date | None,
+    kind: JournalKind | str | None,
+) -> dict[str, Any]:
+    if platform is not Platform.CTRADER:
+        raise UnsupportedOnPlatformError(
+            f"journal() is only served by cTrader terminals, not by {_label(platform)}"
+        )
+    if limit is not None and (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= _MAX_JOURNAL
+    ):
+        raise ValidationError(f"limit must be 1-{_MAX_JOURNAL}, got {limit!r}")
+    kind_value: str | None = None
+    if kind is not None:
+        try:
+            kind_value = JournalKind(str(getattr(kind, "value", kind)).lower()).value
+        except ValueError:
+            raise ValidationError(
+                f"Unknown journal kind: {kind!r} (connection or trade)"
+            ) from None
+    return _clean({"limit": limit, "since": _fmt_since(since), "kind": kind_value})
+
+
+def _fmt_since(value: str | datetime | date | None) -> str | None:
+    """Format a journal ``since`` as UTC with milliseconds
+    (``2026-11-22T21:00:00.000Z``).
+
+    An aware datetime is converted to UTC, a naive one is taken to be UTC
+    already, a date means midnight UTC; a string is sent unchanged.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        dt = value.astimezone(timezone.utc)
+    else:
+        dt = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
 def _order_result(body: Any, headers: Any) -> OrderResult:
     """Build an :class:`OrderResult` from a trade reply and its headers."""
     result = OrderResult.model_validate(body)
@@ -355,6 +471,8 @@ def _order_send_body(
     magic: int | None,
     client_order_id: str | None,
     execution: Execution | None = None,
+    trailing_stop: bool | None = None,
+    guaranteed_stop_loss: bool | None = None,
 ) -> dict[str, Any]:
     return _clean(
         {
@@ -372,14 +490,27 @@ def _order_send_body(
             "expertId": magic,
             "clientOrderId": client_order_id,
             "execution": execution.value if execution else None,
+            "trailingStop": trailing_stop,
+            "guaranteedStopLoss": guaranteed_stop_loss,
         }
     )
 
 
 def _order_close_body(
-    ticket: int, volume: float | None, slippage: int | None, pending_only: bool
+    ticket: int,
+    volume: float | None,
+    slippage: int | None,
+    pending_only: bool,
+    client_order_id: str | None = None,
 ) -> dict[str, Any]:
-    body = _clean({"ticket": ticket, "volume": volume, "slippage": slippage})
+    body = _clean(
+        {
+            "ticket": ticket,
+            "volume": volume,
+            "slippage": slippage,
+            "clientOrderId": client_order_id,
+        }
+    )
     if pending_only:
         body["pendingOnly"] = True
     return body
@@ -408,6 +539,9 @@ def _order_modify_body(
     stop_limit_price: float | None,
     expiration: str | datetime | date | None,
     expiration_utc: str | datetime | date | None,
+    trailing_stop: bool | None = None,
+    guaranteed_stop_loss: bool | None = None,
+    client_order_id: str | None = None,
 ) -> dict[str, Any]:
     return _clean(
         {
@@ -418,8 +552,140 @@ def _order_modify_body(
             "stopLimitPrice": stop_limit_price,
             "expiration": _fmt_time(expiration),
             "expirationUtc": _fmt_utc(expiration_utc),
+            "trailingStop": trailing_stop,
+            "guaranteedStopLoss": guaranteed_stop_loss,
+            "clientOrderId": client_order_id,
         }
     )
+
+
+def _prepare_order_send(
+    platform: Platform,
+    *,
+    symbol: str,
+    operation: OrderOperation | str,
+    volume: float,
+    price: float | None,
+    slippage: int | None,
+    stop_loss: float | None,
+    take_profit: float | None,
+    stop_limit_price: float | None,
+    expiration: str | datetime | date | None,
+    comment: str | None,
+    magic: int | None,
+    expiration_utc: str | datetime | date | None,
+    client_order_id: str | None,
+    execution: Execution | str | None,
+    trailing_stop: bool | None,
+    guaranteed_stop_loss: bool | None,
+) -> dict[str, Any]:
+    """Validate an ``order_send`` and build its body (sync + async)."""
+    op = coerce_operation(operation)
+    _guard_stop_limit_send(platform, op)
+    ex = coerce_execution(execution)
+    if ex is Execution.MANUAL:
+        _validate_manual(
+            platform,
+            op,
+            magic=magic,
+            stop_limit_price=stop_limit_price,
+            expiration=expiration,
+            expiration_utc=expiration_utc,
+        )
+    trailing, guaranteed = _stop_kinds(platform, trailing_stop, guaranteed_stop_loss)
+    _validate_order_send(
+        op,
+        volume=volume,
+        price=price,
+        stop_limit_price=stop_limit_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
+    _check_stop_kinds_need_stop_loss(trailing, guaranteed, stop_loss)
+    _check_expiration(expiration, expiration_utc)
+    _check_client_order_id(client_order_id)
+    return _order_send_body(
+        symbol=symbol,
+        operation=op,
+        volume=volume,
+        price=price,
+        slippage=slippage,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        stop_limit_price=stop_limit_price,
+        expiration=expiration,
+        expiration_utc=expiration_utc,
+        comment=comment,
+        magic=magic,
+        client_order_id=client_order_id,
+        execution=ex,
+        trailing_stop=trailing,
+        guaranteed_stop_loss=guaranteed,
+    )
+
+
+def _prepare_order_modify(
+    platform: Platform,
+    *,
+    ticket: int,
+    stop_loss: float | None,
+    take_profit: float | None,
+    price: float | None,
+    stop_limit_price: float | None,
+    expiration: str | datetime | date | None,
+    clear_stop_loss: bool,
+    clear_take_profit: bool,
+    expiration_utc: str | datetime | date | None,
+    trailing_stop: bool | None,
+    guaranteed_stop_loss: bool | None,
+    client_order_id: str | None,
+) -> dict[str, Any]:
+    """Validate an ``order_modify`` and build its body (sync + async)."""
+    _guard_stop_limit_modify(platform, stop_limit_price)
+    trailing, guaranteed = _stop_kinds(platform, trailing_stop, guaranteed_stop_loss)
+    coid = _ctrader_client_order_id(platform, client_order_id, "order_modify")
+    sl, tp = _resolve_modify_sl_tp(
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        clear_stop_loss=clear_stop_loss,
+        clear_take_profit=clear_take_profit,
+        price=price,
+        stop_limit_price=stop_limit_price,
+    )
+    if clear_stop_loss and (trailing or guaranteed):
+        raise ValidationError(
+            "trailing_stop and guaranteed_stop_loss need a stop loss; "
+            "clear_stop_loss removes it"
+        )
+    _check_expiration(expiration, expiration_utc)
+    return _order_modify_body(
+        ticket=ticket,
+        stop_loss=sl,
+        take_profit=tp,
+        price=price,
+        stop_limit_price=stop_limit_price,
+        expiration=expiration,
+        expiration_utc=expiration_utc,
+        trailing_stop=trailing,
+        guaranteed_stop_loss=guaranteed,
+        client_order_id=coid,
+    )
+
+
+def _prepare_order_close(
+    platform: Platform,
+    *,
+    ticket: int,
+    volume: float | None,
+    slippage: int | None,
+    pending_only: bool,
+    client_order_id: str | None,
+) -> dict[str, Any]:
+    """Validate an ``order_close`` and build its body (sync + async)."""
+    if volume is not None and volume < 0:
+        raise ValidationError(f"volume must be >= 0, got {volume}")
+    coid = _ctrader_client_order_id(platform, client_order_id, "order_close")
+    return _order_close_body(ticket, volume, slippage, pending_only, coid)
 
 
 # --------------------------------------------------------------------------- #
@@ -492,6 +758,34 @@ class TerminalClient:
         return ServerTimezone.model_validate(
             self._http.request("GET", "/ServerTimezone")
         )
+
+    def journal(
+        self,
+        *,
+        limit: int | None = None,
+        since: str | datetime | date | None = None,
+        kind: JournalKind | str | None = None,
+    ) -> list[JournalEntry]:
+        """The account's journal, newest first (``GET /Journal``). cTrader
+        only (bridge 0.1.6): on MT4 / MT5 this raises
+        :class:`~fxsocket.UnsupportedOnPlatformError`.
+
+        Connection entries say when the account signed in at cTrader, became
+        ready, lost and regained its connection, and when its token was
+        refreshed or refused. Trade entries hold every send, modify, close
+        and close-all with its request, outcome, duration,
+        ``client_order_id``, ``User-Agent`` and client address.
+
+        ``limit`` is 1-1000 (the terminal's default is 100). ``since`` keeps
+        entries at or after a moment in UTC (a naive datetime is taken as
+        UTC). ``kind`` is ``connection`` or ``trade`` (see
+        :class:`~fxsocket.JournalKind`). The journal lives in the bridge's
+        memory: the newest 1000 entries of at most 7 days, emptied when the
+        bridge restarts. Use :meth:`order_history` for the full record.
+        """
+        params = _journal_params(self.platform, limit, since, kind)
+        body = self._http.request("GET", "/Journal", params=params)
+        return [JournalEntry.model_validate(r) for r in (body or {}).get("entries", [])]
 
     # -- market data ------------------------------------------------------- #
 
@@ -607,32 +901,26 @@ class TerminalClient:
         expiration_utc: str | datetime | date | None = None,
         client_order_id: str | None = None,
         execution: Execution | str | None = None,
+        trailing_stop: bool | None = None,
+        guaranteed_stop_loss: bool | None = None,
     ) -> OrderResult:
-        op = coerce_operation(operation)
-        _guard_stop_limit_send(self.platform, op)
-        ex = coerce_execution(execution)
-        if ex is Execution.MANUAL:
-            _validate_manual(
-                self.platform,
-                op,
-                magic=magic,
-                stop_limit_price=stop_limit_price,
-                expiration=expiration,
-                expiration_utc=expiration_utc,
-            )
-        _validate_order_send(
-            op,
-            volume=volume,
-            price=price,
-            stop_limit_price=stop_limit_price,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-        )
-        _check_expiration(expiration, expiration_utc)
-        _check_client_order_id(client_order_id)
-        body = _order_send_body(
+        """Place a market or pending order (``POST /OrderSend``).
+
+        A reply only means the terminal answered: check ``success`` and
+        ``retcode``. ``client_order_id`` makes a retry safe (see the module
+        docstring).
+
+        cTrader only: ``trailing_stop=True`` makes the stop loss trail the
+        price, ``guaranteed_stop_loss=True`` makes it guaranteed where the
+        broker offers it (``symbol_info().guaranteed_stop_loss``). Both need
+        a ``stop_loss``. On a limited-risk account
+        (``account_info().limited_risk``) every order gets a guaranteed stop
+        loss by default and needs a ``stop_loss``.
+        """
+        body = _prepare_order_send(
+            self.platform,
             symbol=symbol,
-            operation=op,
+            operation=operation,
             volume=volume,
             price=price,
             slippage=slippage,
@@ -640,11 +928,13 @@ class TerminalClient:
             take_profit=take_profit,
             stop_limit_price=stop_limit_price,
             expiration=expiration,
-            expiration_utc=expiration_utc,
             comment=comment,
             magic=magic,
+            expiration_utc=expiration_utc,
             client_order_id=client_order_id,
-            execution=ex,
+            execution=execution,
+            trailing_stop=trailing_stop,
+            guaranteed_stop_loss=guaranteed_stop_loss,
         )
         return _order_result(
             *self._http.request_with_headers("POST", "/OrderSend", json=body)
@@ -662,25 +952,37 @@ class TerminalClient:
         clear_stop_loss: bool = False,
         clear_take_profit: bool = False,
         expiration_utc: str | datetime | date | None = None,
+        trailing_stop: bool | None = None,
+        guaranteed_stop_loss: bool | None = None,
+        client_order_id: str | None = None,
     ) -> OrderResult:
-        _guard_stop_limit_modify(self.platform, stop_limit_price)
-        sl, tp = _resolve_modify_sl_tp(
+        """Change the stops, entry price or expiry of an order
+        (``POST /OrderModify``). ``None`` keeps a value; a stop is removed
+        with ``clear_stop_loss`` / ``clear_take_profit``, never with ``0``.
+
+        cTrader only: ``trailing_stop`` turns trailing on (``True``) or off
+        (``False``), ``guaranteed_stop_loss`` makes the stop loss guaranteed
+        or normal, ``None`` keeps either as it is. Removing the stop loss
+        drops both. ``client_order_id`` makes the change safe to repeat: the
+        ids of send, modify and close are one set, a repeat changes nothing
+        and answers with the first outcome (``idempotent_replayed``), and
+        reusing an id for a different request raises
+        :class:`~fxsocket.ClientOrderIdReusedError`.
+        """
+        body = _prepare_order_modify(
+            self.platform,
+            ticket=ticket,
             stop_loss=stop_loss,
             take_profit=take_profit,
-            clear_stop_loss=clear_stop_loss,
-            clear_take_profit=clear_take_profit,
-            price=price,
-            stop_limit_price=stop_limit_price,
-        )
-        _check_expiration(expiration, expiration_utc)
-        body = _order_modify_body(
-            ticket=ticket,
-            stop_loss=sl,
-            take_profit=tp,
             price=price,
             stop_limit_price=stop_limit_price,
             expiration=expiration,
+            clear_stop_loss=clear_stop_loss,
+            clear_take_profit=clear_take_profit,
             expiration_utc=expiration_utc,
+            trailing_stop=trailing_stop,
+            guaranteed_stop_loss=guaranteed_stop_loss,
+            client_order_id=client_order_id,
         )
         return _order_result(
             *self._http.request_with_headers("POST", "/OrderModify", json=body)
@@ -693,10 +995,23 @@ class TerminalClient:
         volume: float | None = None,
         slippage: int | None = None,
         pending_only: bool = False,
+        client_order_id: str | None = None,
     ) -> OrderResult:
-        if volume is not None and volume < 0:
-            raise ValidationError(f"volume must be >= 0, got {volume}")
-        body = _order_close_body(ticket, volume, slippage, pending_only)
+        """Close a position, or delete a pending order, by ticket
+        (``POST /OrderClose``). ``volume`` closes part of a position.
+
+        cTrader only: ``client_order_id`` makes the close safe to repeat (a
+        repeat closes nothing more and answers with the first outcome), so a
+        partial close that timed out can be sent again with the same id.
+        """
+        body = _prepare_order_close(
+            self.platform,
+            ticket=ticket,
+            volume=volume,
+            slippage=slippage,
+            pending_only=pending_only,
+            client_order_id=client_order_id,
+        )
         return _order_result(
             *self._http.request_with_headers("POST", "/OrderClose", json=body)
         )
@@ -829,6 +1144,18 @@ class AsyncTerminalClient:
             await self._http.request("GET", "/ServerTimezone")
         )
 
+    async def journal(
+        self,
+        *,
+        limit: int | None = None,
+        since: str | datetime | date | None = None,
+        kind: JournalKind | str | None = None,
+    ) -> list[JournalEntry]:
+        """Async mirror of :meth:`TerminalClient.journal`."""
+        params = _journal_params(self.platform, limit, since, kind)
+        body = await self._http.request("GET", "/Journal", params=params)
+        return [JournalEntry.model_validate(r) for r in (body or {}).get("entries", [])]
+
     async def symbols(self) -> list[str]:
         return list(await self._http.request("GET", "/symbols"))
 
@@ -931,32 +1258,14 @@ class AsyncTerminalClient:
         expiration_utc: str | datetime | date | None = None,
         client_order_id: str | None = None,
         execution: Execution | str | None = None,
+        trailing_stop: bool | None = None,
+        guaranteed_stop_loss: bool | None = None,
     ) -> OrderResult:
-        op = coerce_operation(operation)
-        _guard_stop_limit_send(self.platform, op)
-        ex = coerce_execution(execution)
-        if ex is Execution.MANUAL:
-            _validate_manual(
-                self.platform,
-                op,
-                magic=magic,
-                stop_limit_price=stop_limit_price,
-                expiration=expiration,
-                expiration_utc=expiration_utc,
-            )
-        _validate_order_send(
-            op,
-            volume=volume,
-            price=price,
-            stop_limit_price=stop_limit_price,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-        )
-        _check_expiration(expiration, expiration_utc)
-        _check_client_order_id(client_order_id)
-        body = _order_send_body(
+        """Async mirror of :meth:`TerminalClient.order_send`."""
+        body = _prepare_order_send(
+            self.platform,
             symbol=symbol,
-            operation=op,
+            operation=operation,
             volume=volume,
             price=price,
             slippage=slippage,
@@ -964,11 +1273,13 @@ class AsyncTerminalClient:
             take_profit=take_profit,
             stop_limit_price=stop_limit_price,
             expiration=expiration,
-            expiration_utc=expiration_utc,
             comment=comment,
             magic=magic,
+            expiration_utc=expiration_utc,
             client_order_id=client_order_id,
-            execution=ex,
+            execution=execution,
+            trailing_stop=trailing_stop,
+            guaranteed_stop_loss=guaranteed_stop_loss,
         )
         return _order_result(
             *await self._http.request_with_headers("POST", "/OrderSend", json=body)
@@ -986,25 +1297,25 @@ class AsyncTerminalClient:
         clear_stop_loss: bool = False,
         clear_take_profit: bool = False,
         expiration_utc: str | datetime | date | None = None,
+        trailing_stop: bool | None = None,
+        guaranteed_stop_loss: bool | None = None,
+        client_order_id: str | None = None,
     ) -> OrderResult:
-        _guard_stop_limit_modify(self.platform, stop_limit_price)
-        sl, tp = _resolve_modify_sl_tp(
+        """Async mirror of :meth:`TerminalClient.order_modify`."""
+        body = _prepare_order_modify(
+            self.platform,
+            ticket=ticket,
             stop_loss=stop_loss,
             take_profit=take_profit,
-            clear_stop_loss=clear_stop_loss,
-            clear_take_profit=clear_take_profit,
-            price=price,
-            stop_limit_price=stop_limit_price,
-        )
-        _check_expiration(expiration, expiration_utc)
-        body = _order_modify_body(
-            ticket=ticket,
-            stop_loss=sl,
-            take_profit=tp,
             price=price,
             stop_limit_price=stop_limit_price,
             expiration=expiration,
+            clear_stop_loss=clear_stop_loss,
+            clear_take_profit=clear_take_profit,
             expiration_utc=expiration_utc,
+            trailing_stop=trailing_stop,
+            guaranteed_stop_loss=guaranteed_stop_loss,
+            client_order_id=client_order_id,
         )
         return _order_result(
             *await self._http.request_with_headers("POST", "/OrderModify", json=body)
@@ -1017,10 +1328,17 @@ class AsyncTerminalClient:
         volume: float | None = None,
         slippage: int | None = None,
         pending_only: bool = False,
+        client_order_id: str | None = None,
     ) -> OrderResult:
-        if volume is not None and volume < 0:
-            raise ValidationError(f"volume must be >= 0, got {volume}")
-        body = _order_close_body(ticket, volume, slippage, pending_only)
+        """Async mirror of :meth:`TerminalClient.order_close`."""
+        body = _prepare_order_close(
+            self.platform,
+            ticket=ticket,
+            volume=volume,
+            slippage=slippage,
+            pending_only=pending_only,
+            client_order_id=client_order_id,
+        )
         return _order_result(
             *await self._http.request_with_headers("POST", "/OrderClose", json=body)
         )

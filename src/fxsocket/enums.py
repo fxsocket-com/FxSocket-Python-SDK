@@ -12,10 +12,10 @@ from enum import Enum
 class Platform(str, Enum):
     """Trading platform of a linked account.
 
-    cTrader accounts are linked from the dashboard (a cTrader ID sign-in,
-    no password), not through :meth:`~fxsocket.Client.accounts`
-    ``.create``; once linked they are listed, traded and streamed like
-    MT4 and MT5 accounts.
+    cTrader accounts are linked with a cTrader sign-in, not a password:
+    from the dashboard, or through the API with
+    ``client.ctrader_sign_ins`` (not ``client.accounts.create``). Once
+    linked they are listed, traded and streamed like MT4 and MT5 accounts.
     """
 
     MT4 = "mt4"
@@ -305,6 +305,30 @@ class TerminalErrorCode(str, Enum):
     MRPC_INTERNAL = "MRPC_INTERNAL"  #: 500, bridge fault
     MRPC_UNKNOWN_COMMAND = "MRPC_UNKNOWN_COMMAND"  #: 500, bridge fault
     MRPC = "MRPC"  #: generic code of bridges before MT5 0.17.0 / MT4 0.15.0
+
+
+class JournalKind(str, Enum):
+    """``kind`` of a cTrader ``/Journal`` entry (``journal(kind=...)``)."""
+
+    #: The account's link to cTrader: signed in, ready, connection lost, ...
+    CONNECTION = "connection"
+    #: A trade request and its outcome.
+    TRADE = "trade"
+
+
+class CtraderSignInStatus(str, Enum):
+    """``status`` of a cTrader API sign-in (``client.ctrader_sign_ins``).
+
+    ``PENDING`` until the user comes back from cTrader's consent page,
+    then ``COMPLETED``, ``DENIED`` (the user declined) or ``FAILED``. A
+    pending or completed sign-in past its ``expires_at`` reads ``EXPIRED``.
+    """
+
+    PENDING = "pending"
+    COMPLETED = "completed"
+    DENIED = "denied"
+    EXPIRED = "expired"
+    FAILED = "failed"
 
 
 class HealthStatus(str, Enum):

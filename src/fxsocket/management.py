@@ -1,6 +1,7 @@
 """Account management — the public v1 API.
 
-``client.accounts`` (``/v1/accounts``), ``client.private_servers``
+``client.accounts`` (``/v1/accounts``), ``client.ctrader_sign_ins``
+(``/v1/ctrader/sign-ins``), ``client.private_servers``
 (``/v1/private-servers``), ``client.readonly_keys`` (``/v1/readonly-keys``)
 and the read-only ``client.wallet`` (``/v1/wallet``), on both
 :class:`~fxsocket.Client` and :class:`~fxsocket.AsyncClient`.
@@ -8,14 +9,20 @@ and the read-only ``client.wallet`` (``/v1/wallet``), on both
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from typing import Any
+import asyncio
+import time
+from collections.abc import Iterable, Mapping
+from typing import Any, TypeAlias
 
 from ._http import AsyncHTTP, SyncHTTP
-from .enums import KeyScope, Platform
+from .enums import CtraderSignInStatus, KeyScope, Platform
 from .errors import ValidationError
 from .models import (
     Account,
+    CtraderLinkResult,
+    CtraderSignIn,
+    CtraderSignInAccount,
+    CtraderSignInStarted,
     PrivateServer,
     PrivateServerAccount,
     PrivateServerOptions,
@@ -31,13 +38,15 @@ def account_id_of(account: Account | str) -> str:
 
 def _password_platform(platform: Platform | str) -> str:
     """The platform of a password link. cTrader has none: its accounts are
-    linked from the dashboard with a cTrader ID sign-in, and the API
-    refuses them (HTTP 400), so the SDK says so before sending."""
+    linked with a cTrader sign-in, and the API refuses them (HTTP 400), so
+    the SDK says so before sending."""
     value = Platform(platform)
     if value is Platform.CTRADER:
         raise ValidationError(
-            "cTrader accounts are linked from the FxSocket dashboard (sign in "
-            "with cTrader), not through the API"
+            "cTrader accounts are linked with a cTrader sign-in, not a "
+            "password: start one with client.ctrader_sign_ins.create(), then "
+            "link the accounts the user grants with "
+            "client.ctrader_sign_ins.link_accounts()"
         )
     return value.value
 
@@ -119,6 +128,10 @@ class Accounts:
     ) -> Account:
         """Link (connect) a new MT4/MT5 account. Returns it in ``connecting``
         state — poll :meth:`get` until it reaches ``connected``.
+
+        cTrader accounts have no password: ``platform="ctrader"`` raises
+        :class:`~fxsocket.ValidationError` before sending. Link them with
+        ``client.ctrader_sign_ins`` instead.
 
         ``trade_ea_symbol`` is the chart symbol the terminal hosts its trade
         expert on, exactly as the broker names it (e.g. ``EURUSDm`` on a
@@ -232,6 +245,249 @@ class AsyncAccounts:
 
     async def delete(self, account: Account | str) -> None:
         await self._http.request("DELETE", f"/accounts/{account_id_of(account)}")
+
+
+# --------------------------------------------------------------------------- #
+# cTrader sign-in (``/v1/ctrader/sign-ins``)
+# --------------------------------------------------------------------------- #
+
+#: Anything that names a sign-in: one of the models, or its id.
+SignInRef: TypeAlias = CtraderSignIn | CtraderSignInStarted | str
+
+#: One account to link: its ``ctrader_account_id``, the granted row itself,
+#: or a mapping with ``ctrader_account_id`` and an optional ``nickname``.
+CtraderAccountRef: TypeAlias = int | CtraderSignInAccount | Mapping[str, Any]
+
+_MAX_LINK = 50
+
+
+def sign_in_id_of(sign_in: SignInRef) -> str:
+    """Accept a :class:`CtraderSignIn`, a :class:`CtraderSignInStarted` or a
+    bare id string."""
+    if isinstance(sign_in, (CtraderSignIn, CtraderSignInStarted)):
+        return sign_in.id
+    return str(sign_in)
+
+
+def _create_sign_in_payload(return_url: str) -> dict[str, Any]:
+    return {"return_url": return_url} if return_url else {}
+
+
+def _link_item(account: CtraderAccountRef) -> dict[str, Any]:
+    nickname: Any = None
+    if isinstance(account, CtraderSignInAccount):
+        account_id: Any = account.ctrader_account_id
+    elif isinstance(account, Mapping):
+        unknown = set(account) - {"ctrader_account_id", "nickname"}
+        if unknown:
+            raise ValidationError(f"unknown field(s) {sorted(unknown)} in accounts")
+        account_id = account.get("ctrader_account_id")
+        nickname = account.get("nickname")
+    else:
+        account_id = account
+    if isinstance(account_id, bool) or not isinstance(account_id, int):
+        raise ValidationError(
+            f"ctrader_account_id must be a whole number, got {account_id!r}"
+        )
+    if account_id < 1:
+        raise ValidationError(f"ctrader_account_id must be >= 1, got {account_id}")
+    item: dict[str, Any] = {"ctrader_account_id": account_id}
+    if nickname is not None:
+        if not isinstance(nickname, str) or len(nickname) > 64:
+            raise ValidationError("nickname must be a string of at most 64 characters")
+        item["nickname"] = nickname
+    return item
+
+
+def _link_payload(accounts: Iterable[CtraderAccountRef]) -> dict[str, Any]:
+    """Body of ``POST /ctrader/sign-ins/{id}/accounts``, checked the way the
+    API checks it: 1-50 accounts, each once."""
+    if isinstance(accounts, (str, bytes, Mapping)):
+        raise ValidationError("accounts must be a list")
+    items = [_link_item(a) for a in accounts]
+    if not items:
+        raise ValidationError("accounts must not be empty")
+    if len(items) > _MAX_LINK:
+        raise ValidationError(
+            f"at most {_MAX_LINK} accounts per call, got {len(items)}"
+        )
+    ids = [item["ctrader_account_id"] for item in items]
+    if len(ids) != len(set(ids)):
+        raise ValidationError("each account may be listed once")
+    return {"accounts": items}
+
+
+def _link_results(data: Any) -> list[CtraderLinkResult]:
+    rows = data.get("accounts", []) if isinstance(data, dict) else []
+    return [CtraderLinkResult.model_validate(row) for row in rows]
+
+
+def _check_wait(timeout: float, interval: float) -> None:
+    if timeout < 0:
+        raise ValidationError(f"timeout must be >= 0, got {timeout}")
+    if interval <= 0:
+        raise ValidationError(f"interval must be > 0, got {interval}")
+
+
+class CtraderSignIns:
+    """Link cTrader accounts through the API (``client.ctrader_sign_ins``).
+
+    cTrader accounts have no password: the user signs in at cTrader and
+    allows FxSocket's cTrader application access. The flow:
+
+    1. :meth:`create` a sign-in and send the user's browser to its
+       ``authorize_url`` (cTrader's consent page, which names "FX Socket").
+    2. :meth:`wait` until the user is done (or :meth:`get` it when the
+       browser comes back to your ``return_url``).
+    3. :meth:`link_accounts` with the granted accounts you want.
+
+    Every call needs the full key (a read-only key gets
+    :class:`~fxsocket.ForbiddenError`, reads included). Where cTrader is
+    not available to your account they raise
+    :class:`~fxsocket.NotFoundError` with ``code == "ctrader_unavailable"``.
+    Whoever holds your API key and gets someone to allow access gets trading
+    access to their cTrader accounts, so keep the key on your server.
+    """
+
+    def __init__(self, http: SyncHTTP) -> None:
+        self._http = http
+
+    def create(self, *, return_url: str = "") -> CtraderSignInStarted:
+        """Start a sign-in (``POST /v1/ctrader/sign-ins``).
+
+        The user has 10 minutes to finish cTrader's consent page. After it
+        the browser goes to ``return_url`` with ``fxsocket_sign_in=<id>``
+        and ``status=<status>`` added to the query, or, without one, to an
+        FxSocket page that asks the user to return to your app.
+        ``return_url`` must be https (http only for localhost), without user
+        info or fragment, on an origin FxSocket has allowed for you; any
+        other raises :class:`~fxsocket.ValidationError` with ``code ==
+        "return_url_not_allowed"``. At most 20 sign-ins may wait at once and
+        60 may be started per hour; past that it raises
+        :class:`~fxsocket.SignInLimitError` with ``retry_after``.
+        """
+        data = self._http.request(
+            "POST", "/ctrader/sign-ins", json=_create_sign_in_payload(return_url)
+        )
+        return CtraderSignInStarted.model_validate(data)
+
+    def get(self, sign_in: SignInRef) -> CtraderSignIn:
+        """How the sign-in went and, once ``completed``, the trading accounts
+        the user granted (``GET /v1/ctrader/sign-ins/{id}``). A finished
+        sign-in stays readable for 60 minutes. An unknown id raises
+        :class:`~fxsocket.NotFoundError` (``code == "sign_in_not_found"``).
+        """
+        data = self._http.request("GET", f"/ctrader/sign-ins/{sign_in_id_of(sign_in)}")
+        return CtraderSignIn.model_validate(data)
+
+    def wait(
+        self,
+        sign_in: SignInRef,
+        *,
+        timeout: float = 660.0,
+        interval: float = 2.0,
+    ) -> CtraderSignIn:
+        """Poll :meth:`get` every ``interval`` seconds until the sign-in is
+        no longer ``pending``, for at most ``timeout`` seconds.
+
+        Returns the last sign-in read: ``completed``, ``denied``,
+        ``failed`` or ``expired``, or still ``pending`` when ``timeout`` ran
+        out first, so check ``status``. The default timeout outlasts the
+        10 minutes the user has for the consent page, after which a pending
+        sign-in reads ``expired``.
+        """
+        _check_wait(timeout, interval)
+        deadline = time.monotonic() + timeout
+        while True:
+            current = self.get(sign_in)
+            if current.status != CtraderSignInStatus.PENDING:
+                return current
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return current
+            time.sleep(min(interval, remaining))
+
+    def link_accounts(
+        self,
+        sign_in: SignInRef,
+        accounts: Iterable[CtraderAccountRef],
+    ) -> list[CtraderLinkResult]:
+        """Link accounts a completed sign-in granted
+        (``POST /v1/ctrader/sign-ins/{id}/accounts``).
+
+        ``accounts`` are up to 50 ``ctrader_account_id`` values,
+        :class:`~fxsocket.CtraderSignInAccount` rows (``sign_in.accounts``,
+        or ``sign_in.linkable_accounts``), or mappings with
+        ``ctrader_account_id`` and an optional ``nickname``, each once.
+        Returns one :class:`~fxsocket.CtraderLinkResult` per account, in
+        order: the linked account, or why that one was refused (plan, seat
+        and duplicate rules as :meth:`Accounts.create`). An account already
+        linked through this sign-in comes back as linked, so a call whose
+        answer was lost can be repeated.
+
+        Refused as a whole, nothing linked:
+        :class:`~fxsocket.SignInNotCompletedError` (still pending, denied
+        or failed), :class:`~fxsocket.SignInExpiredError` (60 minutes after
+        the user came back), :class:`~fxsocket.CtraderAccountNotInSignInError`
+        (an account the sign-in did not grant) and
+        :class:`~fxsocket.CtraderReauthRequiredError` (cTrader no longer
+        accepts the sign-in).
+        """
+        data = self._http.request(
+            "POST",
+            f"/ctrader/sign-ins/{sign_in_id_of(sign_in)}/accounts",
+            json=_link_payload(accounts),
+        )
+        return _link_results(data)
+
+
+class AsyncCtraderSignIns:
+    """Asynchronous mirror of :class:`CtraderSignIns`."""
+
+    def __init__(self, http: AsyncHTTP) -> None:
+        self._http = http
+
+    async def create(self, *, return_url: str = "") -> CtraderSignInStarted:
+        data = await self._http.request(
+            "POST", "/ctrader/sign-ins", json=_create_sign_in_payload(return_url)
+        )
+        return CtraderSignInStarted.model_validate(data)
+
+    async def get(self, sign_in: SignInRef) -> CtraderSignIn:
+        data = await self._http.request(
+            "GET", f"/ctrader/sign-ins/{sign_in_id_of(sign_in)}"
+        )
+        return CtraderSignIn.model_validate(data)
+
+    async def wait(
+        self,
+        sign_in: SignInRef,
+        *,
+        timeout: float = 660.0,
+        interval: float = 2.0,
+    ) -> CtraderSignIn:
+        _check_wait(timeout, interval)
+        deadline = time.monotonic() + timeout
+        while True:
+            current = await self.get(sign_in)
+            if current.status != CtraderSignInStatus.PENDING:
+                return current
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return current
+            await asyncio.sleep(min(interval, remaining))
+
+    async def link_accounts(
+        self,
+        sign_in: SignInRef,
+        accounts: Iterable[CtraderAccountRef],
+    ) -> list[CtraderLinkResult]:
+        data = await self._http.request(
+            "POST",
+            f"/ctrader/sign-ins/{sign_in_id_of(sign_in)}/accounts",
+            json=_link_payload(accounts),
+        )
+        return _link_results(data)
 
 
 # --------------------------------------------------------------------------- #

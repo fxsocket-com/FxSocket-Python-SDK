@@ -7,6 +7,53 @@ up to 0.7.0 are described in their tagged commits.
 
 ## [Unreleased]
 
+cTrader sign-in through the API, and the trading extras of cTrader bridge
+0.1.6. Everything new is additive: MT4 and MT5 rows keep the defaults.
+
+### Added
+
+- `client.ctrader_sign_ins` links cTrader accounts without the dashboard:
+  `create(return_url=...)` (`CtraderSignInStarted` with `authorize_url`),
+  `get()` (`CtraderSignIn` with the granted `CtraderSignInAccount` rows and
+  `linkable_accounts`), `wait()` (polls until the sign-in is no longer
+  pending, with `timeout` and `interval`) and `link_accounts()` (up to 50,
+  one `CtraderLinkResult` per account). `CtraderSignInStatus` lists the
+  statuses.
+- Errors for the sign-in routes: `SignInLimitError` (429, a `RateLimitError`
+  with `retry_after` and `limit`), `SignInNotCompletedError` (409, with
+  `sign_in_status`), `SignInExpiredError` (410),
+  `CtraderReauthRequiredError` (409) and `CtraderAccountNotInSignInError`
+  (400, a `ValidationError` with `ctrader_account_ids`).
+- `Account.reauth_required` (cTrader: the sign-in was revoked) and
+  `Account.suspended` (billing suspended the account).
+- `order_send(trailing_stop=..., guaranteed_stop_loss=...)` and the same on
+  `order_modify` (`None` keeps them), cTrader only. Both need a
+  `stop_loss`; the SDK raises `ValidationError` before sending otherwise.
+- `order_modify(client_order_id=...)` and `order_close(client_order_id=...)`
+  on cTrader: one set of ids with `order_send`, so a modify or partial close
+  that timed out can be sent again safely.
+- `journal(limit=, since=, kind=)` on the terminal client, cTrader only, with
+  the new `JournalEntry` model and `JournalKind` enum.
+- `OpenedOrder.trailing_stop` / `.guaranteed_stop_loss` and the same on
+  `PendingOrder` (so on the `positions` and `orders` stream frames too),
+  `AccountInfo.limited_risk`, `SymbolInfo.guaranteed_stop_loss` and
+  `.gsl_distance`. `False` / `0` on MT4 and MT5.
+- `OrderLeg` / `OrderDefaults` take `trailing_stop` and
+  `guaranteed_stop_loss` for `client.orders.send()`, checked for a
+  `stop_loss` before sending. An MT4 or MT5 leg with either set to `True`
+  fails the batch at the API (`invalid_batch`).
+
+### Changed
+
+- On MT4 and MT5, `journal()`, `trailing_stop=True`,
+  `guaranteed_stop_loss=True` and `client_order_id` on `order_modify` /
+  `order_close` raise `UnsupportedOnPlatformError` before sending, since the
+  MT terminals would ignore them. `False` for a stop loss kind is simply not
+  sent there.
+- `accounts.create()` and `private_servers.add_account()` with
+  `platform="ctrader"` now point to `client.ctrader_sign_ins` instead of the
+  dashboard.
+
 ## [0.11.0] - 2026-11-20
 
 Support for terminal bridges MT5 0.18.3 / MT4 0.16.2. Everything new is

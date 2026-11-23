@@ -70,6 +70,12 @@ class Account(BaseModel):
     there is none; the proxy credentials are never returned).
     ``trade_ea_symbol`` is the chart symbol hosting the trade expert —
     empty means the terminal picked one automatically.
+
+    ``suspended`` is true while billing has suspended the account: it reads
+    ``disconnected`` and stays down until it is paid for and reconnected.
+    ``reauth_required`` is cTrader only: true when cTrader no longer
+    accepts the account's sign-in (the user revoked the access), so it stays
+    down until the owner signs in again. Always false on MT4 and MT5.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -81,6 +87,8 @@ class Account(BaseModel):
     login: int
     status: TradingStatus
     error: str = ""
+    suspended: bool = False
+    reauth_required: bool = False
     rest_url: str = ""
     ws_url: str = ""
     proxy_address: str = ""
@@ -204,6 +212,122 @@ class PrivateServerOptions(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Management API (v1) — cTrader sign-in (``/v1/ctrader/sign-ins``)
+# --------------------------------------------------------------------------- #
+
+
+class CtraderSignInStarted(BaseModel):
+    """A new cTrader sign-in (``client.ctrader_sign_ins.create()``).
+
+    Send the user's browser to ``authorize_url``, cTrader's consent page (a
+    redirect or a new tab, not an iframe). The user has until
+    ``expires_at`` (10 minutes) to finish it. ``status`` is ``pending``.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    authorize_url: str
+    status: str
+    expires_at: datetime
+
+
+class CtraderSignInAccount(BaseModel):
+    """One cTrader trading account a completed sign-in granted.
+
+    ``ctrader_account_id`` is cTrader's id for it, the one to link it by.
+    ``login`` is the account number the user knows. ``account_type`` is
+    ``hedged``, ``netted`` or ``None``, ``currency`` the deposit currency
+    or ``None``. ``unavailable_reason`` is ``None`` when the account can be
+    linked, else the error linking it would answer (``ctrader_inactive``,
+    ``ctrader_live_not_allowed`` or ``ctrader_netting_not_allowed``).
+    ``linked_account_id`` is your FxSocket account id when the account is
+    linked already.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    ctrader_account_id: int
+    login: int = 0
+    broker: str = ""
+    live: bool = False
+    account_type: str | None = None
+    currency: str | None = None
+    active: bool = True
+    unavailable_reason: str | None = None
+    linked_account_id: str | None = None
+
+    @property
+    def is_available(self) -> bool:
+        """True when nothing stands in the way of linking it."""
+        return self.unavailable_reason is None
+
+    @property
+    def is_linked(self) -> bool:
+        """True when it is one of your FxSocket accounts already."""
+        return self.linked_account_id is not None
+
+
+class CtraderSignIn(BaseModel):
+    """How a cTrader sign-in went (``client.ctrader_sign_ins.get()``).
+
+    ``status`` compares against :class:`fxsocket.CtraderSignInStatus`.
+    ``error`` is ``None``, or why it did not complete (``access_denied``,
+    ``code_refused``, ``token_refused``, ``ctrader_unreachable``,
+    ``ctrader_refused``, ``missing_code``, ``ctrader_unavailable`` or
+    ``internal_error``). ``accounts`` is empty unless ``completed``.
+    While pending, ``expires_at`` is the deadline for the consent page;
+    after it, how long the result can be read and linked (60 minutes).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    status: str
+    error: str | None = None
+    created_at: datetime
+    expires_at: datetime
+    accounts: list[CtraderSignInAccount] = []
+
+    @property
+    def is_pending(self) -> bool:
+        return self.status == "pending"
+
+    @property
+    def is_completed(self) -> bool:
+        return self.status == "completed"
+
+    @property
+    def linkable_accounts(self) -> list[CtraderSignInAccount]:
+        """The granted accounts that can be linked and are not linked yet."""
+        return [a for a in self.accounts if a.is_available and not a.is_linked]
+
+
+class CtraderLinkResult(BaseModel):
+    """What happened to one account of
+    ``client.ctrader_sign_ins.link_accounts()``.
+
+    ``account`` is the linked account (``connecting`` or ``connected``;
+    poll ``client.accounts.get()``), or ``None`` on error. ``error`` is
+    then the reason (``account_cap_reached``, ``seat_lapsed``,
+    ``insufficient_balance``, ``no_subscription``, ``duplicate``,
+    ``ctrader_inactive``, ``ctrader_live_not_allowed`` or
+    ``ctrader_netting_not_allowed``) and ``detail`` says it in words.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    ctrader_account_id: int
+    account: Account | None = None
+    error: str | None = None
+    detail: str = ""
+
+    @property
+    def is_linked(self) -> bool:
+        return self.account is not None
+
+
+# --------------------------------------------------------------------------- #
 # Management API (v1) — read-only keys (``/v1/readonly-keys``)
 # --------------------------------------------------------------------------- #
 
@@ -296,6 +420,13 @@ class _OrderFields(BaseModel):
         validation_alias=AliasChoices("magic", "expert_id"),
         serialization_alias="expert_id",
     )
+    #: cTrader only: the stop loss trails the price. Needs ``stop_loss``. A
+    #: leg for an MT4 or MT5 account with it set to ``True`` fails the whole
+    #: batch (``400 invalid_batch``).
+    trailing_stop: bool | None = None
+    #: cTrader only: a guaranteed stop loss, where the broker offers it.
+    #: Needs ``stop_loss``. Same rule for MT4 / MT5 legs as ``trailing_stop``.
+    guaranteed_stop_loss: bool | None = None
 
 
 class OrderDefaults(_OrderFields):
@@ -719,6 +850,10 @@ class AccountInfo(_Camel):
 
     On MT4 ``margin_mode`` is always ``"Hedging"`` and ``fifo_close`` always
     ``False`` (the platform has no native equivalent).
+
+    ``limited_risk`` is cTrader only (bridge 0.1.6): a limited-risk account
+    takes guaranteed stop losses only, so every order gets one by default
+    and needs a ``stop_loss``. Always ``False`` on MT4 and MT5.
     """
 
     name: str
@@ -737,10 +872,17 @@ class AccountInfo(_Camel):
     trade_expert: bool
     limit_orders: int
     fifo_close: bool
+    limited_risk: bool = False
 
 
 class OpenedOrder(_Camel):
-    """An open position or resting pending order (``GET /OpenedOrders``)."""
+    """An open position or resting pending order (``GET /OpenedOrders``,
+    and the rows of the ``positions`` stream).
+
+    ``trailing_stop`` and ``guaranteed_stop_loss`` are cTrader only (bridge
+    0.1.6): the stop loss trails the price, or is guaranteed. Always
+    ``False`` on MT4 and MT5.
+    """
 
     ticket: int
     symbol: str
@@ -756,6 +898,8 @@ class OpenedOrder(_Camel):
     magic: int
     comment: str
     open_time: str
+    trailing_stop: bool = False
+    guaranteed_stop_loss: bool = False
 
     @property
     def is_pending(self) -> bool:
@@ -777,6 +921,10 @@ class PendingOrder(_Camel):
     (empty when the order does not expire) and ``expiration_utc`` the same
     moment in real UTC. ``time`` is when it was placed (server time);
     ``time_utc`` is ``None`` until the bridge has read the server clock.
+
+    ``trailing_stop`` and ``guaranteed_stop_loss`` are cTrader only (bridge
+    0.1.6): the stop loss the fill gets trails the price, or is guaranteed.
+    Always ``False`` on MT4 and MT5.
     """
 
     ticket: int
@@ -795,6 +943,8 @@ class PendingOrder(_Camel):
     comment: str = ""
     time: str = ""
     time_utc: str | None = None
+    trailing_stop: bool = False
+    guaranteed_stop_loss: bool = False
 
 
 class HistoryTrade(_Camel):
@@ -873,6 +1023,44 @@ class ServerTimezone(_Camel):
 
     server_time: str
     utc_offset_seconds: int
+
+
+class JournalEntry(_Camel):
+    """One entry of a cTrader account's journal (``journal()``, bridge 0.1.6).
+
+    ``seq`` numbers the entries per account from 1, oldest first. ``time``
+    is real UTC with milliseconds (not broker server time). ``kind`` is
+    ``connection`` (the account's link to cTrader) or ``trade`` (a trade
+    request and its outcome); compare against :class:`fxsocket.JournalKind`.
+
+    ``event`` for ``connection``: ``started``, ``updated``, ``signed_in``,
+    ``sign_in_failed``, ``ready``, ``connection_lost``, ``connected``,
+    ``token_invalidated``, ``token_replaced``, ``signed_in_again``,
+    ``sign_in_again_failed``. For ``trade``: ``OrderSend``,
+    ``OrderModify``, ``OrderClose``, ``CloseAll``, ``replayed`` (a repeat
+    answered with the first request's outcome) and ``refused`` (turned away
+    before it reached cTrader).
+
+    Trade entries carry ``request`` (the request as the bridge understood
+    it) and ``result`` (``success``, ``retcode``, ``order``, ``deal``,
+    ``position``, ``volume``, ``price`` and ``comment``, or ``error`` and
+    ``message``), both free-form, plus ``client_order_id``,
+    ``duration_ms``, ``command_id``, the caller's ``user_agent`` and its
+    ``client_ip`` as the gateway saw it. Each is ``None`` when absent.
+    """
+
+    seq: int
+    time: str
+    kind: str
+    event: str
+    message: str = ""
+    request: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
+    client_order_id: str | None = None
+    duration_ms: int | None = None
+    command_id: int | None = None
+    user_agent: str | None = None
+    client_ip: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -959,6 +1147,11 @@ class SymbolInfo(_Camel):
     ``ioc``, ``boc``) are what the broker accepts for the symbol. MT4 reports
     its fixed set (no stop-limit, ``gtc``/``specified``, no filling
     policies). They are empty on bridges before MT5 0.17.0 / MT4 0.15.0.
+
+    ``guaranteed_stop_loss`` and ``gsl_distance`` are cTrader only (bridge
+    0.1.6): the broker takes guaranteed stop losses on this symbol, and
+    the least distance in points between one and the market (0 when there
+    is none). ``False`` / ``0`` on MT4 and MT5.
     """
 
     symbol: str
@@ -987,6 +1180,8 @@ class SymbolInfo(_Camel):
     order_modes: list[str] = []
     expiration_modes: list[str] = []
     filling_modes: list[str] = []
+    guaranteed_stop_loss: bool = False
+    gsl_distance: int = 0
 
 
 class SymbolInfoError(_Camel):

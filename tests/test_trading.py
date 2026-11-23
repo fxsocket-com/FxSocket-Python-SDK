@@ -372,6 +372,77 @@ def test_invalid_batch_and_readonly_key_errors() -> None:
             fx.orders.send([A1], defaults=defaults)
 
 
+@respx.mock
+def test_send_ctrader_stop_kinds() -> None:
+    route = respx.post(f"{BASE}/orders").mock(
+        return_value=httpx.Response(200, json=ORDER_RESPONSE)
+    )
+    with _client() as fx:
+        fx.orders.send(
+            [
+                OrderLeg(account_id=A1, trailing_stop=True),
+                {"account_id": A2, "guaranteed_stop_loss": True, "stop_loss": 1.06},
+            ],
+            defaults=OrderDefaults(
+                symbol="EURUSD", operation="Buy", volume=0.1, stop_loss=1.07
+            ),
+        )
+    assert _sent(route)["orders"] == [
+        {"account_id": A1, "trailing_stop": True},
+        {"account_id": A2, "stop_loss": 1.06, "guaranteed_stop_loss": True},
+    ]
+
+
+@pytest.mark.parametrize(
+    "leg",
+    [
+        {"account_id": A1, "trailing_stop": True},
+        {"account_id": A1, "guaranteed_stop_loss": True, "stop_loss": 0},
+    ],
+)
+@respx.mock
+def test_send_stop_kinds_need_a_stop_loss(leg: dict[str, Any]) -> None:
+    route = respx.post(f"{BASE}/orders").mock(
+        return_value=httpx.Response(200, json=ORDER_RESPONSE)
+    )
+    defaults = {"symbol": "EURUSD", "operation": "Buy", "volume": 0.1}
+    with _client() as fx, pytest.raises(ValidationError, match="stop_loss"):
+        fx.orders.send([leg], defaults=defaults)
+    assert not route.called
+
+
+@respx.mock
+def test_send_stop_kinds_false_needs_no_stop_loss() -> None:
+    route = respx.post(f"{BASE}/orders").mock(
+        return_value=httpx.Response(200, json=ORDER_RESPONSE)
+    )
+    defaults = {"symbol": "EURUSD", "operation": "Buy", "volume": 0.1}
+    with _client() as fx:
+        fx.orders.send([{"account_id": A1, "trailing_stop": False}], defaults=defaults)
+    assert _sent(route)["orders"] == [{"account_id": A1, "trailing_stop": False}]
+
+
+@respx.mock
+def test_send_stop_kind_on_an_mt_leg_fails_the_batch() -> None:
+    respx.post(f"{BASE}/orders").mock(
+        return_value=httpx.Response(
+            400,
+            json={
+                "error": "invalid_batch",
+                "detail": "Some legs are invalid.",
+                "errors": {"0": ["trailing_stop is cTrader only"]},
+            },
+        )
+    )
+    defaults = {"symbol": "EURUSD", "operation": "Buy", "volume": 0.1}
+    with _client() as fx, pytest.raises(ValidationError) as err:
+        fx.orders.send(
+            [{"account_id": A1, "trailing_stop": True, "stop_loss": 1.07}],
+            defaults=defaults,
+        )
+    assert err.value.code == "invalid_batch"
+
+
 # --------------------------------------------------------------------------- #
 # close
 # --------------------------------------------------------------------------- #

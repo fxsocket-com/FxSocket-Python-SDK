@@ -50,15 +50,42 @@ class NotBalanceFundedError(ForbiddenError):
 
 
 class RateLimitError(FxSocketError):
-    """Too many requests (HTTP 429). ``retry_after`` is seconds, if given."""
+    """Too many requests (HTTP 429). ``retry_after`` is seconds, if given.
+
+    Base class for :class:`SignInLimitError`."""
 
     def __init__(self, message: str, *, retry_after: float | None = None, **kw: Any):
         super().__init__(message, **kw)
         self.retry_after = retry_after
 
 
+class SignInLimitError(RateLimitError):
+    """Too many cTrader sign-ins (HTTP 429): 20 are already waiting
+    (``code == "sign_in_pending_limit"``) or 60 were started in the last
+    hour (``"sign_in_hourly_limit"``). ``limit`` is the limit that was hit,
+    ``retry_after`` the seconds to wait before starting another."""
+
+    def __init__(self, message: str, *, limit: int | None = None, **kw: Any):
+        super().__init__(message, **kw)
+        self.limit = limit
+
+
 class ValidationError(FxSocketError):
-    """The request was rejected as malformed (HTTP 400 / ``MRPC_VALIDATION``)."""
+    """The request was rejected as malformed (HTTP 400 / ``MRPC_VALIDATION``).
+
+    Base class for :class:`CtraderAccountNotInSignInError`."""
+
+
+class CtraderAccountNotInSignInError(ValidationError):
+    """The cTrader sign-in did not grant every account asked for (HTTP 400
+    ``ctrader_account_not_in_sign_in``). Nothing was linked.
+    ``ctrader_account_ids`` lists the ones it does not grant."""
+
+    def __init__(
+        self, message: str, *, ctrader_account_ids: list[int] | None = None, **kw: Any
+    ):
+        super().__init__(message, **kw)
+        self.ctrader_account_ids = ctrader_account_ids or []
 
 
 class NotFoundError(FxSocketError):
@@ -169,6 +196,29 @@ class AlreadyLapsedError(FxSocketError):
     buy a new server."""
 
 
+class SignInNotCompletedError(FxSocketError):
+    """Accounts can only be linked from a completed cTrader sign-in (HTTP
+    409 ``sign_in_not_completed``). ``sign_in_status`` is the sign-in's
+    status (``pending``, ``denied`` or ``failed``). Wait for a pending one,
+    or start a new sign-in."""
+
+    def __init__(self, message: str, *, sign_in_status: str | None = None, **kw: Any):
+        super().__init__(message, **kw)
+        self.sign_in_status = sign_in_status
+
+
+class SignInExpiredError(FxSocketError):
+    """The cTrader sign-in has expired (HTTP 410 ``sign_in_expired``).
+    Accounts can be linked for 60 minutes after the user came back from
+    cTrader. Start a new sign-in."""
+
+
+class CtraderReauthRequiredError(FxSocketError):
+    """cTrader no longer accepts this sign-in (HTTP 409
+    ``ctrader_reauth_required``): the user revoked the access since. Start a
+    new sign-in."""
+
+
 class IdempotencyError(FxSocketError):
     """A multi-account batch was refused because of its ``Idempotency-Key``.
 
@@ -254,11 +304,17 @@ class ManualNotSentError(FxSocketError):
 class UnsupportedOnPlatformError(FxSocketError):
     """A requested feature doesn't exist on the account's platform.
 
-    Raised before anything is sent, currently for stop-limit orders on MT4:
-    ``BuyStopLimit`` / ``SellStopLimit`` on ``order_send``, and
-    ``stop_limit_price`` on ``order_modify`` (MT4 has no stop-limit order
-    type; its terminal API rejects the first and would silently ignore the
-    second).
+    Raised before anything is sent:
+
+    * stop-limit orders on MT4 and cTrader: ``BuyStopLimit`` /
+      ``SellStopLimit`` on ``order_send``, and ``stop_limit_price`` on
+      ``order_modify``;
+    * ``execution="Manual"`` on cTrader;
+    * the cTrader-only parts on MT4 and MT5: ``trailing_stop=True`` and
+      ``guaranteed_stop_loss=True`` on ``order_send`` / ``order_modify``,
+      ``client_order_id`` on ``order_modify`` / ``order_close``, and
+      ``journal()``. The MT terminals would silently ignore the fields, and
+      they have no ``/Journal`` route.
     """
 
 
@@ -272,6 +328,7 @@ _CONNECT_CODES = frozenset(
 _IDEMPOTENCY_CODES = frozenset(
     {"idempotency_in_flight", "idempotency_key_reused", "idempotency_unavailable"}
 )
+_SIGN_IN_LIMIT_CODES = frozenset({"sign_in_pending_limit", "sign_in_hourly_limit"})
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -312,6 +369,7 @@ def error_from_response(resp: httpx.Response) -> FxSocketError:
         return ForbiddenError(message, **common)
     if code in _IDEMPOTENCY_CODES:
         return IdempotencyError(message, **common)
+    fields: dict[str, Any] = body if isinstance(body, dict) else {}
     if status == 429:
         raw = resp.headers.get("Retry-After")
         retry = None
@@ -320,10 +378,28 @@ def error_from_response(resp: httpx.Response) -> FxSocketError:
                 retry = float(raw)
             except ValueError:
                 retry = None
+        if code in _SIGN_IN_LIMIT_CODES:
+            return SignInLimitError(
+                message,
+                retry_after=retry,
+                limit=_int_or_none(fields.get("limit")),
+                **common,
+            )
         return RateLimitError(message, retry_after=retry, **common)
     if status == 404:
         return NotFoundError(message, **common)
+    if code == "sign_in_expired":
+        return SignInExpiredError(message, **common)
     if status == 409:
+        if code == "sign_in_not_completed":
+            status_value = fields.get("status")
+            return SignInNotCompletedError(
+                message,
+                sign_in_status=status_value if isinstance(status_value, str) else None,
+                **common,
+            )
+        if code == "ctrader_reauth_required":
+            return CtraderReauthRequiredError(message, **common)
         if code == "MRPC_CLIENT_ORDER_ID_REUSED":
             return ClientOrderIdReusedError(message, **common)
         if code == "MRPC_NOT_PENDING":
@@ -340,7 +416,6 @@ def error_from_response(resp: httpx.Response) -> FxSocketError:
             return AlreadyLapsedError(message, **common)
         return DuplicateAccountError(message, **common)
     if status == 402:
-        fields: dict[str, Any] = body if isinstance(body, dict) else {}
         if code == "account_cap_reached":
             return AccountCapError(
                 message, cap=fields.get("cap"), current=fields.get("current"), **common
@@ -362,6 +437,16 @@ def error_from_response(resp: httpx.Response) -> FxSocketError:
     if status == 400:
         if code in _CONNECT_CODES:
             return ConnectFailedError(message, **common)
+        if code == "ctrader_account_not_in_sign_in":
+            raw_ids = fields.get("ctrader_account_ids")
+            if not isinstance(raw_ids, list):
+                raw_ids = []
+            ids = [_int_or_none(v) for v in raw_ids]
+            return CtraderAccountNotInSignInError(
+                message,
+                ctrader_account_ids=[i for i in ids if i is not None],
+                **common,
+            )
         return ValidationError(message, **common)
     if status == 503:
         return TerminalNotReadyError(message, **common)

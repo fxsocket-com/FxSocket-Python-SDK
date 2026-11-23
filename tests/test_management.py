@@ -121,7 +121,7 @@ def test_create_refuses_ctrader_before_sending() -> None:
     route = respx.post(f"{BASE}/accounts").mock(
         return_value=httpx.Response(201, json=CTRADER_ACCOUNT)
     )
-    with _client() as fx, pytest.raises(ValidationError, match="dashboard"):
+    with _client() as fx, pytest.raises(ValidationError, match="ctrader_sign_ins"):
         fx.accounts.create(server="x", login=1, password="pw", platform="ctrader")
     assert not route.called
 

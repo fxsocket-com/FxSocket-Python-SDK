@@ -1,7 +1,8 @@
 """Top-level entry points: :class:`Client` (sync) and :class:`AsyncClient`.
 
-Both expose the management API — ``.accounts``, ``.private_servers``,
-``.readonly_keys``, ``.wallet`` and ``.orders`` (multi-account trading) —
+Both expose the management API — ``.accounts``, ``.ctrader_sign_ins``,
+``.private_servers``, ``.readonly_keys``, ``.wallet`` and ``.orders``
+(multi-account trading) —
 plus ``.terminal(account)`` (the per-account terminal REST client) and
 ``.stream(account)`` (WebSocket streaming — a sync :class:`~fxsocket.Stream`
 or an async :class:`~fxsocket.AsyncStream`).
@@ -19,9 +20,11 @@ from .errors import AuthError, TerminalNotReadyError
 from .management import (
     Accounts,
     AsyncAccounts,
+    AsyncCtraderSignIns,
     AsyncPrivateServers,
     AsyncReadOnlyKeys,
     AsyncWalletResource,
+    CtraderSignIns,
     PrivateServers,
     ReadOnlyKeys,
     WalletResource,
@@ -74,6 +77,8 @@ class Client:
         )
         #: Account management (the v1 API).
         self.accounts = Accounts(SyncHTTP(self._http_client))
+        #: Link cTrader accounts with a cTrader sign-in (the v1 API).
+        self.ctrader_sign_ins = CtraderSignIns(SyncHTTP(self._http_client))
         #: Private hosting servers (the v1 API).
         self.private_servers = PrivateServers(SyncHTTP(self._http_client))
         #: Multi-account trading — one order / close fanned out to several
@@ -201,6 +206,7 @@ class AsyncClient:
             timeout=timeout,
         )
         self.accounts = AsyncAccounts(AsyncHTTP(self._http_client))
+        self.ctrader_sign_ins = AsyncCtraderSignIns(AsyncHTTP(self._http_client))
         self.private_servers = AsyncPrivateServers(AsyncHTTP(self._http_client))
         self.orders = AsyncOrders(AsyncHTTP(self._http_client))
         self.readonly_keys = AsyncReadOnlyKeys(AsyncHTTP(self._http_client))
